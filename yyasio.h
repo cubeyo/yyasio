@@ -18,6 +18,40 @@ enum ErrorCode
     YYASIO_SUBMIT_ERROR
 };
 
+template <typename T>
+class Promise
+{
+public:
+    struct Awaiter
+    {
+        Awaiter(Promise* promise): _promise(promise) {}
+        bool await_ready() const noexcept { return false; }
+        bool await_suspend(std::coroutine_handle<> handle) noexcept {
+            _promise->_coro = handle;
+            return true;
+        }
+        T await_resume() const noexcept {
+            _promise->_coro = nullptr;
+            return _promise->_value;
+        }
+        Promise* _promise;
+    };
+
+    Awaiter wait() { return Awaiter(this); }
+
+    void resume(T value)
+    {
+        if (_coro)
+        {
+            _value = value;
+            _coro.resume();
+        }
+    }
+private:
+    std::coroutine_handle<> _coro {};
+    T _value;
+};
+
 struct Task
 {
     struct promise_type

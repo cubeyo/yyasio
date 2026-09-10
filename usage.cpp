@@ -91,6 +91,26 @@ yyasio::Task run_simple_server(yyasio::Scheduler* scheduler, int listen_port)
     return accept_connections(scheduler, listen_fd);
 }
 
+yyasio::Task infinite_loop(yyasio::Promise<int>& promise)
+{
+    while (true)
+    {
+        std::cout << "Wait for promise \n";
+        int val = co_await promise.wait();
+        std::cout << "Promise triggered with value: " << val << "\n";
+    }
+}
+
+yyasio::Task tick_trigger(yyasio::Scheduler* scheduler, yyasio::Promise<int>& promise)
+{
+    int val = 0;
+    while (true)
+    {
+        co_await yyasio::timeout(scheduler, { .tv_sec = 1, .tv_nsec = 0 });
+        promise.resume(val++);
+    }
+}
+
 int main()
 {
     yyasio::Scheduler scheduler;
@@ -106,6 +126,11 @@ int main()
     timeout_trigger(&scheduler);
 
     visit_regular_file(&scheduler);
+
+    yyasio::Promise<int> promise;
+    infinite_loop(promise);
+    tick_trigger(&scheduler, promise);
+
 
     // will block here
     scheduler.run();
