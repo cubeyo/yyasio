@@ -8,6 +8,23 @@
 #include <queue>
 #include <liburing.h>
 
+// This macro is not defined by liburing <= 2.0
+#ifndef IO_URING_VERSION_MAJOR
+#define IO_URING_VERSION_MAJOR 0
+#define IO_URING_VERSION_MINOR 0
+#endif
+
+#define YYASIO_LIBURING_AT_LEAST(major, minor) \
+    (IO_URING_VERSION_MAJOR > (major) || \
+     (IO_URING_VERSION_MAJOR == (major) && IO_URING_VERSION_MINOR >= (minor)))
+
+// Cancel fd API not provided by liburing < 2.3
+#if !YYASIO_LIBURING_AT_LEAST(2, 3)
+#ifndef IORING_ASYNC_CANCEL_FD
+#define IORING_ASYNC_CANCEL_FD (1U << 1)
+#endif
+#endif
+
 namespace yyasio
 {
 
@@ -283,6 +300,27 @@ private:
     const char* pathname = nullptr;
     int flags = 0;
     mode_t mode = 0;
+};
+
+struct cancel_fd: UringAwaiter
+{
+public:
+    explicit cancel_fd(Scheduler* scheduler, int fd, unsigned flags = 0)
+        : UringAwaiter(scheduler), fd(fd), flags(flags) {}
+
+    void prepare_sqe(io_uring_sqe* sqe) override
+    {
+#if YYASIO_LIBURING_AT_LEAST(2, 3)
+        io_uring_prep_cancel_fd(sqe, fd, flags);
+#else
+        // Requires: kernel >= 5.19
+        io_uring_prep_cancel(sqe, nullptr, static_cast<int>(flags | IORING_ASYNC_CANCEL_FD));
+        sqe->fd = fd;
+#endif
+    }
+private:
+    int fd = 0;
+    unsigned flags = 0;
 };
 
 struct close: UringAwaiter

@@ -16,12 +16,20 @@ yyasio::Task handle_client(yyasio::Scheduler* scheduler, int conn_fd)
         int bytes_read = co_await yyasio::read(scheduler, conn_fd, buf, 1024);
         if (bytes_read <= 0)
         {
-            std::cout << "Connection closed, ret =" << bytes_read << "\n";
+            std::cout << "Connection closed, fd = " << conn_fd << ", ret =" << bytes_read << "\n";
             close(conn_fd);
             co_return;
         }
         std::cout << "Received data: " << bytes_read << "--" << std::string(buf, bytes_read) << "\n";
     }
+}
+
+yyasio::Task cancel_after_3s(yyasio::Scheduler* scheduler, int fd)
+{
+    // after cancel called, async read will return with bytes_read = 0
+    co_await yyasio::timeout(scheduler, { .tv_sec = 3, .tv_nsec = 0 });
+    std::cout << "Canceling fd: " << fd << "\n";
+    co_await yyasio::cancel_fd(scheduler, fd);
 }
 
 yyasio::Task accept_connections(yyasio::Scheduler* scheduler, int listen_fd)
@@ -37,6 +45,7 @@ yyasio::Task accept_connections(yyasio::Scheduler* scheduler, int listen_fd)
         std::cout << "Accepted connection: " << conn_fd << ", from:" << ip_str << ":" << ntohs(addr.sin_port) << "\n";
 
         handle_client(scheduler, conn_fd);
+        cancel_after_3s(scheduler, conn_fd); // just demostrate how to cancel
     }
 }
 
@@ -56,7 +65,7 @@ yyasio::Task visit_regular_file(yyasio::Scheduler* scheduler)
     while (true)
     {
         co_await yyasio::timeout(scheduler, { .tv_sec = 1, .tv_nsec = 0 });
-        int fd = co_await yyasio::openat(scheduler, dir_fd, "test.txt", O_RDWR);
+        int fd = co_await yyasio::openat(scheduler, dir_fd, "test.txt", O_RDWR | O_CREAT, 0644);
         if (fd < 0)
         {
             std::cerr << "Failed to open file";
@@ -130,7 +139,6 @@ int main()
     yyasio::Promise<int> promise;
     infinite_loop(promise);
     tick_trigger(&scheduler, promise);
-
 
     // will block here
     scheduler.run();
