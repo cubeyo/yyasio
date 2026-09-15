@@ -1,11 +1,13 @@
 #pragma once
 
-#include <cmath>
 #include <cstring>
+#include <ctime>
+#include <iomanip>
 #include <iostream>
 #include <coroutine>
 #include <functional>
 #include <queue>
+#include <unordered_map>
 #include <liburing.h>
 
 // This macro is not defined by liburing <= 2.0
@@ -23,6 +25,29 @@
 #ifndef IORING_ASYNC_CANCEL_FD
 #define IORING_ASYNC_CANCEL_FD (1U << 1)
 #endif
+#endif
+
+#define DEBUG 1
+#if DEBUG
+constexpr const char* _filename_only(const char* path) {
+    const char* name = path;
+    for (const char* p = path; *p; ++p) { if (*p == '/') name = p + 1; }
+    return name;
+}
+#define debug_coro(hint, coro) \
+    do { \
+        struct timespec _ts; \
+        clock_gettime(CLOCK_REALTIME, &_ts); \
+        struct tm _tm; \
+        localtime_r(&_ts.tv_sec, &_tm); \
+        char _buf[32]; \
+        strftime(_buf, sizeof(_buf), "%Y-%m-%d %H:%M:%S", &_tm); \
+        std::cout << "[" << _buf << "." << std::setw(9) << std::setfill('0') << _ts.tv_nsec << "]" \
+                  << " [" << _filename_only(__FILE__) << ":" << __LINE__ << "]" \
+                  << " [Coro] " << hint << std::hex << coro.address() << std::dec << "\n"; \
+    } while(0)
+#else
+#define debug_coro(hint, coro) do {} while(0)
 #endif
 
 namespace yyasio
@@ -69,24 +94,152 @@ private:
     T _value;
 };
 
+struct FinalAwaiter {
+    std::coroutine_handle<> continuation;
+    FinalAwaiter(std::coroutine_handle<> continuation) : continuation(continuation) {}
+    bool await_ready() const noexcept { return false; }
+    std::coroutine_handle<> await_suspend(std::coroutine_handle<> handle) noexcept {
+        if (continuation)
+        {
+            /* Case1: this sub coroutine is not fire-and-forget,
+             * the parent is waiting for its result
+             * handle to the parent, the parent will destroy
+             * frame of sub coroutine in await_resume.
+             */
+            debug_coro("switch to next coro:", continuation);
+            return continuation;
+        }
+        else
+        {
+            /* Case2: this sub coroutine is fire-and-forget,
+             * the parent does not care about its result,
+             * just destroy the frame here.
+             */
+            debug_coro("destroy coro in final_awaiter(fire-and-forget mode):", handle);
+            handle.destroy();
+            return std::noop_coroutine(); // return noop coroutine to avoid resuming null handle
+        }
+    }
+    void await_resume() const noexcept { }
+};
+
+template<typename T>
 struct Task
 {
     struct promise_type
     {
-        int result = 0;
-        Task get_return_object() { return {}; }
+        T result;
+        Task get_return_object() {
+            return Task(std::coroutine_handle<promise_type>::from_promise(*this));
+        }
         std::suspend_never initial_suspend() noexcept { return {}; }
-        std::suspend_always final_suspend() noexcept { return {}; }
+        FinalAwaiter final_suspend() noexcept { return {_caller}; }
+        void return_value(T value)
+        {
+            result = value;
+        }
+        void unhandled_exception() {std::terminate(); }
+        ~promise_type() = default;
+        std::coroutine_handle<> _caller;
+    };
+
+    std::coroutine_handle<promise_type> _callee = nullptr;
+    Task(std::coroutine_handle<promise_type> handle) : _callee(handle)
+    {
+        debug_coro("create coro for non-void task:", _callee);
+    }
+    Task(Task&& other) noexcept : _callee(other._callee) { other._callee = nullptr; }
+    Task& operator=(Task&&) = delete;
+
+    // Frame is self-destroyed in FinalAwaiter::await_suspend.
+    // ~Task() is intentionally a no-op to support fire-and-forget usage.
+    ~Task()
+    {
+        debug_coro("destroy task for handle:", _callee);
+    }
+
+    // to support co_await on Task
+    auto operator co_await() const noexcept {
+        struct Awaiter {
+            std::coroutine_handle<promise_type> _callee;
+            Awaiter(std::coroutine_handle<promise_type> callee) : _callee(callee) {}
+            bool await_ready() const noexcept { return false; }
+            void await_suspend(std::coroutine_handle<> caller) noexcept
+            {
+                _callee.promise()._caller = caller;
+                debug_coro("suspend coro:", caller);
+            }
+            T await_resume() const noexcept
+            {
+                // awaiter inside parent's frame,
+                // can safely destroy sub coroutine's frame here
+                debug_coro("subcoro finished:", _callee);
+                T result = _callee.promise().result;
+                debug_coro("destroy coro:", _callee);
+                _callee.destroy();
+                return result;
+            }
+        };
+        return Awaiter(_callee);
+    }
+};
+
+template<>
+struct Task<void>
+{
+    struct promise_type
+    {
+        Task get_return_object() {
+            return Task(std::coroutine_handle<promise_type>::from_promise(*this));
+        }
+        std::suspend_never initial_suspend() noexcept { return {}; }
+        FinalAwaiter final_suspend() noexcept { return {_caller}; }
         void return_void() {}
         void unhandled_exception() {std::terminate(); }
+        ~promise_type() = default;
+        std::coroutine_handle<> _caller; // will set value on await_suspend
     };
+
+    std::coroutine_handle<promise_type> _callee = nullptr;
+    Task(std::coroutine_handle<promise_type> handle) : _callee(handle)
+    {
+        debug_coro("create coro for void task:", _callee);
+    }
+    Task(Task&& other) noexcept : _callee(other._callee) { other._callee = nullptr; }
+    Task& operator=(Task&&) = delete;
+    ~Task()
+    {
+        // Frame is self-destroyed in FinalAwaiter::await_suspend.
+        // ~Task() is intentionally a no-op to support fire-and-forget usage.
+        debug_coro("destroy task for handle:", _callee);
+    }
+
+    // to support co_await on Task
+    auto operator co_await() const noexcept {
+        struct Awaiter {
+            std::coroutine_handle<promise_type> _callee;
+            Awaiter(std::coroutine_handle<promise_type> handle) : _callee(handle) {}
+            bool await_ready() const noexcept { return false; }
+            void await_suspend(std::coroutine_handle<> caller) noexcept
+            {
+                _callee.promise()._caller = caller;
+                debug_coro("suspend coro:", caller);
+            }
+            void await_resume() const noexcept
+            {
+                debug_coro("subcoro finished:", _callee);
+                debug_coro("destroy coro:", _callee);
+                _callee.destroy();
+            }
+        };
+        return Awaiter(_callee);
+    }
 };
+
+using PrepSqeClosure = std::function<void(io_uring_sqe*)>;
 
 class Scheduler
 {
-public:
-    using PrepSqeCb = std::function<void(io_uring_sqe*)>;
-
 public:
     ErrorCode init(size_t entries) {
         if (io_uring_queue_init(entries, &ring, 0) < 0)
@@ -96,11 +249,12 @@ public:
         return YYASIO_OK;
     }
 
-    void schedule(std::coroutine_handle<> coro, PrepSqeCb prep_seq_fn)
+    void schedule(std::coroutine_handle<> coro, PrepSqeClosure prep_seq_fn, int* presult)
     {
         struct timespec enter_ts {};
         clock_gettime(CLOCK_MONOTONIC, &enter_ts);
-        pending_queue.push(std::make_tuple(coro, prep_seq_fn, enter_ts));
+        debug_coro("schedule coro:", coro);
+        pending_queue.push(std::make_tuple(coro, prep_seq_fn, presult, enter_ts));
     }
 
     ErrorCode run()
@@ -108,11 +262,16 @@ public:
         while (true)
         {
             batch_prepare_sqe();
+            // TODO: avoid waiting for single long io
             int submitted = io_uring_submit_and_wait(&ring, 1);
             if (submitted < 0)
             {
                 std::cerr << "io_uring_submit_and_wait failed:, ret = " << submitted << "\n";
                 return YYASIO_SUBMIT_ERROR;
+            }
+            else if (submitted == 0)
+            {
+                std::cerr << "WARNING: io_uring_submit_and_wait returned 0 (no SQEs submitted), pending_queue.size=" << pending_queue.size() << "\n";
             }
 
             tot_submit_items += submitted;
@@ -123,14 +282,15 @@ public:
             {
                 // NOLINTNEXTLINE(cppcoreguidelines-pro-type-reinterpret-cast)
                 auto handle = std::coroutine_handle<>::from_address(reinterpret_cast<void*>(cqe->user_data)); 
+                debug_coro("io returned:", handle);
                 io_uring_cqe_seen(&ring, cqe);
-                auto task_handle = std::coroutine_handle<Task::promise_type>::from_address(handle.address());
-                task_handle.promise().result = cqe->res;
-                handle.resume();
-                if (handle.done())
+                auto it = coro_res.find(handle.address());
+                if (it != coro_res.end())
                 {
-                    handle.destroy();
+                    *it->second = cqe->res;
+                    coro_res.erase(it);
                 }
+                handle.resume();
             }
         }
     }
@@ -146,6 +306,7 @@ public:
         std::cout << "Average pending queue size: " << tot_pending_queue_size / tot_pending_queue_sample_count << "\n";
     }
 
+
 private:
     void batch_prepare_sqe()
     {
@@ -157,10 +318,11 @@ private:
             auto* sqe = io_uring_get_sqe(&ring);
             if (!sqe)
             {
+                std::cerr << "WARNING: io_uring_get_sqe returned NULL! pending_queue.size=" << pending_queue.size() << "\n";
                 break;
             }
-            auto [coro, prep_sqe_fn, enter_ts] = pending_queue.front();
-            
+            auto [coro, prep_sqe_fn, res_addr, enter_ts] = pending_queue.front();
+
             struct timespec sched_ts {};
             clock_gettime(CLOCK_MONOTONIC, &sched_ts);
             uint64_t cost_ns = (static_cast<uint64_t>(sched_ts.tv_sec) * 1000000000ULL + sched_ts.tv_nsec) -
@@ -168,14 +330,20 @@ private:
             tot_sched_time += cost_ns;
             tot_sched_count++;
 
+            debug_coro("prepare sqe for coro:", coro);
             prep_sqe_fn(sqe);
             io_uring_sqe_set_data(sqe, coro.address());
+            if (res_addr)
+            {
+                coro_res[coro.address()] = res_addr;
+            }
             pending_queue.pop();
         }
     }
 
     io_uring ring {};
-    std::queue<std::tuple<std::coroutine_handle<>, PrepSqeCb, struct timespec>> pending_queue;
+    std::queue<std::tuple<std::coroutine_handle<>, PrepSqeClosure, int*, struct timespec>> pending_queue;
+    std::unordered_map<void*, int*> coro_res; // maps coroutine address to its result address
     uint64_t tot_sched_time = 0;
     uint64_t tot_sched_count = 0;
     uint64_t tot_submit_items = 0;
@@ -187,129 +355,84 @@ private:
 struct UringAwaiter
 {
 public:
-    explicit UringAwaiter(Scheduler* scheduler)
-        : scheduler(scheduler){}
+    explicit UringAwaiter(Scheduler* scheduler, PrepSqeClosure prepare_sqe_fn)
+        : scheduler(scheduler), _prepare_sqe_fn(prepare_sqe_fn) {}
     
-    UringAwaiter(const UringAwaiter&) = delete;
-    UringAwaiter& operator=(const UringAwaiter&) = delete;
-    UringAwaiter(UringAwaiter&&) = delete;
-    UringAwaiter& operator=(UringAwaiter&&) = delete;
+    // UringAwaiter(const UringAwaiter&) = delete;
+    // UringAwaiter& operator=(const UringAwaiter&) = delete;
+    // UringAwaiter(UringAwaiter&&) = delete;
+    // UringAwaiter& operator=(UringAwaiter&&) = delete;
 
-    virtual ~UringAwaiter() = default;
+    virtual ~UringAwaiter()
+    {
+        debug_coro("awaiter destroyed by coro:", coro_handle);
+    }
 
     bool await_ready() const noexcept { return false; }
     bool await_suspend(std::coroutine_handle<> handle) noexcept
     {
         coro_handle = handle;
-        scheduler->schedule(handle, [this](io_uring_sqe* sqe) { prepare_sqe(sqe); });
+        scheduler->schedule(handle, _prepare_sqe_fn, &result);
         return true;
     }
 
     int await_resume() const noexcept
     {
-        auto task_handle = std::coroutine_handle<Task::promise_type>::from_address(coro_handle.address());
-        return task_handle.promise().result;
+        debug_coro("await_resume for coro:", coro_handle);
+        return result;
     }
-
-    virtual void prepare_sqe(io_uring_sqe* sqe) = 0;
 
 private:
     Scheduler* scheduler = nullptr;
+    PrepSqeClosure _prepare_sqe_fn;
     std::coroutine_handle<> coro_handle{};
+    int result = 0;
 };
 
-struct accept: UringAwaiter
+inline UringAwaiter accept(Scheduler* scheduler, int listen_fd, struct sockaddr* paddr, socklen_t* plen, int flags = SOCK_CLOEXEC | SOCK_NONBLOCK)
 {
-public:
-    explicit accept(Scheduler* scheduler, int listen_fd, struct sockaddr* paddr, socklen_t* plen, int flags = SOCK_CLOEXEC | SOCK_NONBLOCK)
-        : UringAwaiter(scheduler), listen_fd(listen_fd), paddr(paddr), plen(plen), flags(flags) {}
-
-    void prepare_sqe(io_uring_sqe* sqe) override
-    {
+    PrepSqeClosure prepare_sqe_cb = [listen_fd, paddr, plen, flags](io_uring_sqe* sqe) -> void {
         io_uring_prep_accept(sqe, listen_fd, paddr, plen, flags);
-    }
-private:
-    int listen_fd = 0;
-    struct sockaddr* paddr = nullptr;
-    socklen_t* plen = nullptr;
-    int flags = 0;
-};
+    };
+    return UringAwaiter{ scheduler, prepare_sqe_cb };
+}
 
-struct read: UringAwaiter
+inline UringAwaiter read(Scheduler* scheduler, int fd, void* buffer, size_t buffer_size, size_t offset = 0)
 {
-public:
-    explicit read(Scheduler* scheduler, int fd, void* buffer, size_t buffer_size, size_t offset = 0)
-        : UringAwaiter(scheduler), fd(fd), buffer(buffer), buffer_size(buffer_size), offset(offset) {}
-
-    void prepare_sqe(io_uring_sqe* sqe) override
-    {
+    PrepSqeClosure prepare_sqe_cb = [fd, buffer, buffer_size, offset](io_uring_sqe* sqe) -> void {
         io_uring_prep_read(sqe, fd, buffer, buffer_size, offset);
-    }
-private:
-    int fd = 0;
-    void* buffer = nullptr;
-    size_t buffer_size = 0;
-    size_t offset = 0;
-};
+    };
+    return UringAwaiter{ scheduler, prepare_sqe_cb };
+}
 
-struct write: UringAwaiter
+inline UringAwaiter write(Scheduler* scheduler, int fd, const void* buffer, size_t buffer_size, size_t offset = 0)
 {
-public:
-    explicit write(Scheduler* scheduler, int fd, const void* buffer, size_t buffer_size, size_t offset = 0)
-        : UringAwaiter(scheduler), fd(fd), buffer(buffer), buffer_size(buffer_size), offset(offset) {}
-
-    void prepare_sqe(io_uring_sqe* sqe) override
-    {
+    PrepSqeClosure prepare_sqe_cb = [fd, buffer, buffer_size, offset](io_uring_sqe* sqe) -> void {
         io_uring_prep_write(sqe, fd, buffer, buffer_size, offset);
-    }
-private:
-    int fd = 0;
-    const void* buffer = nullptr;
-    size_t buffer_size = 0;
-    size_t offset = 0;
-};
+    };
+    return UringAwaiter{ scheduler, prepare_sqe_cb };
+}
 
-struct timeout: UringAwaiter
+// for kernel <= 5.9, time_spec should be valid until the operation completes
+inline UringAwaiter timeout(Scheduler* scheduler, struct __kernel_timespec* time_spec, unsigned int count = 0, unsigned int flags = 0)
 {
-public:
-    explicit timeout(Scheduler* scheduler, struct __kernel_timespec time_spec, unsigned int count = 0, unsigned int flags = 0)
-        : UringAwaiter(scheduler), ts(time_spec), count(count), flags(flags) {}
+    PrepSqeClosure prepare_sqe_cb = [time_spec, count, flags](io_uring_sqe* sqe) -> void {
+        io_uring_prep_timeout(sqe, time_spec, count, flags);
+    };
+    return UringAwaiter{ scheduler, prepare_sqe_cb };
+}
 
-    void prepare_sqe(io_uring_sqe* sqe) override
-    {
-        io_uring_prep_timeout(sqe, &ts, count, flags);
-    }
-private:
-    struct __kernel_timespec ts;
-    unsigned int count = 0;
-    unsigned int flags = 0;
-};
-
-struct openat: UringAwaiter
+inline UringAwaiter openat(Scheduler* scheduler, int dirfd, const char* pathname, int flags, mode_t mode = 0)
 {
-public:
-    explicit openat(Scheduler* scheduler, int dirfd, const char* pathname, int flags, mode_t mode = 0)
-        : UringAwaiter(scheduler), dirfd(dirfd), pathname(pathname), flags(flags), mode(mode) {}
-
-    void prepare_sqe(io_uring_sqe* sqe) override
-    {
+    PrepSqeClosure prepare_sqe_cb = [dirfd, pathname, flags, mode](io_uring_sqe* sqe) -> void {
         io_uring_prep_openat(sqe, dirfd, pathname, flags, mode);
-    }
-private:
-    int dirfd = 0;
-    const char* pathname = nullptr;
-    int flags = 0;
-    mode_t mode = 0;
-};
+    };
+    return UringAwaiter{ scheduler, prepare_sqe_cb };
+}
 
-struct cancel_fd: UringAwaiter
+inline UringAwaiter cancel_fd(Scheduler* scheduler, int fd, unsigned flags = 0)
 {
-public:
-    explicit cancel_fd(Scheduler* scheduler, int fd, unsigned flags = 0)
-        : UringAwaiter(scheduler), fd(fd), flags(flags) {}
-
-    void prepare_sqe(io_uring_sqe* sqe) override
-    {
+    PrepSqeClosure prepare_sqe_cb = [fd, flags](io_uring_sqe* sqe) -> void {
 #if YYASIO_LIBURING_AT_LEAST(2, 3)
         io_uring_prep_cancel_fd(sqe, fd, flags);
 #else
@@ -317,25 +440,17 @@ public:
         io_uring_prep_cancel(sqe, nullptr, static_cast<int>(flags | IORING_ASYNC_CANCEL_FD));
         sqe->fd = fd;
 #endif
-    }
-private:
-    int fd = 0;
-    unsigned flags = 0;
-};
+    };
+    return UringAwaiter{ scheduler, prepare_sqe_cb };
+}
 
-struct close: UringAwaiter
+inline UringAwaiter close(Scheduler* scheduler, int fd)
 {
-public:
-    explicit close(Scheduler* scheduler, int fd)
-        : UringAwaiter(scheduler), fd(fd) {}
-
-    void prepare_sqe(io_uring_sqe* sqe) override
-    {
+    PrepSqeClosure prepare_sqe_cb = [fd](io_uring_sqe* sqe) -> void {
         io_uring_prep_close(sqe, fd);
-    }
-private:
-    int fd = 0;
-};
+    };
+    return UringAwaiter{ scheduler, prepare_sqe_cb };
+}
 
 } // namespace yyasio
 

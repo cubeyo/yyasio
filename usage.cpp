@@ -8,7 +8,7 @@
 #include <arpa/inet.h>
 #include "yyasio.h"
 
-yyasio::Task handle_client(yyasio::Scheduler* scheduler, int conn_fd)
+yyasio::Task<void> handle_client(yyasio::Scheduler* scheduler, int conn_fd)
 {
     char buf[1024];
     while (true)
@@ -24,15 +24,16 @@ yyasio::Task handle_client(yyasio::Scheduler* scheduler, int conn_fd)
     }
 }
 
-yyasio::Task cancel_after_3s(yyasio::Scheduler* scheduler, int fd)
+yyasio::Task<void> cancel_after_3s(yyasio::Scheduler* scheduler, int fd)
 {
     // after cancel called, async read will return with bytes_read = 0
-    co_await yyasio::timeout(scheduler, { .tv_sec = 3, .tv_nsec = 0 });
+    struct __kernel_timespec ts = { .tv_sec = 3, .tv_nsec = 0 };
+    co_await yyasio::timeout(scheduler, &ts);
     std::cout << "Canceling fd: " << fd << "\n";
     co_await yyasio::cancel_fd(scheduler, fd);
 }
 
-yyasio::Task accept_connections(yyasio::Scheduler* scheduler, int listen_fd)
+yyasio::Task<void> accept_connections(yyasio::Scheduler* scheduler, int listen_fd)
 {
     while (true)
     {
@@ -49,22 +50,39 @@ yyasio::Task accept_connections(yyasio::Scheduler* scheduler, int listen_fd)
     }
 }
 
-yyasio::Task timeout_trigger(yyasio::Scheduler* scheduler)
+yyasio::Task<int> coro_with_return_val(yyasio::Scheduler* scheduler)
 {
+    std::cout << "enter coro with return val...\n";
+    struct __kernel_timespec ts = { .tv_sec = 1, .tv_nsec = 0 };
+    co_await yyasio::timeout(scheduler, &ts);
+    
+    std::cout << "exit coro with return val, calling co_return...\n";
+    co_return 100;
+}
+
+yyasio::Task<void> timeout_trigger(yyasio::Scheduler* scheduler)
+{
+    std::cout << "start timeout trigger...\n";
     while (true)
     {
-        int ret = co_await yyasio::timeout(scheduler, { .tv_sec = 1, .tv_nsec = 0 });
+        struct __kernel_timespec ts = { .tv_sec = 1, .tv_nsec = 0 };
+        std::cout << "Waiting for timeout...\n";
+        int ret = co_await yyasio::timeout(scheduler, &ts);
         std::cout << "Timeout triggered, ret = " << ret << "\n";
-        scheduler->print_sched_stats();
+        // scheduler->print_sched_stats();
+        std::cout << "Waiting for new coroutine...\n";
+        auto val = co_await coro_with_return_val(scheduler);
+        std::cout << "Return value: " << val << "\n";
     }
 }
 
-yyasio::Task visit_regular_file(yyasio::Scheduler* scheduler)
+yyasio::Task<void> visit_regular_file(yyasio::Scheduler* scheduler)
 {
     int dir_fd = co_await yyasio::openat(scheduler, AT_FDCWD, "/tmp", O_RDONLY | O_DIRECTORY);
     while (true)
     {
-        co_await yyasio::timeout(scheduler, { .tv_sec = 1, .tv_nsec = 0 });
+        struct __kernel_timespec ts = { .tv_sec = 1, .tv_nsec = 0 };
+        co_await yyasio::timeout(scheduler, &ts);
         int fd = co_await yyasio::openat(scheduler, dir_fd, "test.txt", O_RDWR | O_CREAT, 0644);
         if (fd < 0)
         {
@@ -83,7 +101,7 @@ yyasio::Task visit_regular_file(yyasio::Scheduler* scheduler)
     }
 }
 
-yyasio::Task run_simple_server(yyasio::Scheduler* scheduler, int listen_port)
+yyasio::Task<void> run_simple_server(yyasio::Scheduler* scheduler, int listen_port)
 {
     int listen_fd = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0);
     int opt = 1;
@@ -100,7 +118,7 @@ yyasio::Task run_simple_server(yyasio::Scheduler* scheduler, int listen_port)
     return accept_connections(scheduler, listen_fd);
 }
 
-yyasio::Task infinite_loop(yyasio::Promise<int>& promise)
+yyasio::Task<void> infinite_loop(yyasio::Promise<int>& promise)
 {
     while (true)
     {
@@ -110,12 +128,13 @@ yyasio::Task infinite_loop(yyasio::Promise<int>& promise)
     }
 }
 
-yyasio::Task tick_trigger(yyasio::Scheduler* scheduler, yyasio::Promise<int>& promise)
+yyasio::Task<void> tick_trigger(yyasio::Scheduler* scheduler, yyasio::Promise<int>& promise)
 {
     int val = 0;
     while (true)
     {
-        co_await yyasio::timeout(scheduler, { .tv_sec = 1, .tv_nsec = 0 });
+        struct __kernel_timespec ts = { .tv_sec = 1, .tv_nsec = 0 };
+        co_await yyasio::timeout(scheduler, &ts);
         promise.resume(val++);
     }
 }
@@ -130,15 +149,15 @@ int main()
         std::terminate();
     }
 
-    run_simple_server(&scheduler, 8080);
+    // run_simple_server(&scheduler, 8080);
 
     timeout_trigger(&scheduler);
 
-    visit_regular_file(&scheduler);
+    // visit_regular_file(&scheduler);
 
-    yyasio::Promise<int> promise;
-    infinite_loop(promise);
-    tick_trigger(&scheduler, promise);
+    // yyasio::Promise<int> promise;
+    // infinite_loop(promise);
+    // tick_trigger(&scheduler, promise);
 
     // will block here
     scheduler.run();
