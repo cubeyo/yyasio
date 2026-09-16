@@ -2,7 +2,6 @@
 
 #include <cstring>
 #include <ctime>
-#include <iomanip>
 #include <iostream>
 #include <coroutine>
 #include <functional>
@@ -27,7 +26,7 @@
 #endif
 #endif
 
-#define DEBUG 1
+#define DEBUG 0
 #if DEBUG
 constexpr const char* _filename_only(const char* path) {
     const char* name = path;
@@ -94,6 +93,22 @@ private:
     T _value;
 };
 
+struct CoroIdAwaiter {
+    uint64_t id = 0;
+    bool await_ready() const noexcept { return false; }
+    template<typename promise_type>
+    bool await_suspend(std::coroutine_handle<promise_type> handle) noexcept {
+        id = handle.promise().coro_id;
+        return false;
+    }
+    uint64_t await_resume() const noexcept { return id; }
+};
+
+inline CoroIdAwaiter current_coro_id()
+{
+    return CoroIdAwaiter();
+}
+
 struct FinalAwaiter {
     std::coroutine_handle<> continuation;
     FinalAwaiter(std::coroutine_handle<> continuation) : continuation(continuation) {}
@@ -129,10 +144,18 @@ struct Task
     struct promise_type
     {
         T result;
+        uint64_t coro_id = 0;
         Task get_return_object() {
-            return Task(std::coroutine_handle<promise_type>::from_promise(*this));
+            static uint64_t salt = 0;
+            auto coro = std::coroutine_handle<promise_type>::from_promise(*this);
+            coro_id = reinterpret_cast<uint64_t>(coro.address()) ^ (++salt);
+            return Task(coro);
         }
-        std::suspend_never initial_suspend() noexcept { return {}; }
+        // always suspend on initializetion,
+        // will be resumed in either case:
+        // 1. caller co_await on this task, will resume on caller's await_suspend
+        // 2. caller fire-and-forget, will resume on detach() called
+        std::suspend_always initial_suspend() noexcept { return {}; }
         FinalAwaiter final_suspend() noexcept { return {_caller}; }
         void return_value(T value)
         {
@@ -158,16 +181,23 @@ struct Task
         debug_coro("destroy task for handle:", _callee);
     }
 
+    void detach()
+    {
+        _callee.resume();
+        _callee = nullptr;
+    }
+
     // to support co_await on Task
     auto operator co_await() const noexcept {
         struct Awaiter {
             std::coroutine_handle<promise_type> _callee;
             Awaiter(std::coroutine_handle<promise_type> callee) : _callee(callee) {}
             bool await_ready() const noexcept { return false; }
-            void await_suspend(std::coroutine_handle<> caller) noexcept
+            std::coroutine_handle<> await_suspend(std::coroutine_handle<> caller) noexcept
             {
                 _callee.promise()._caller = caller;
                 debug_coro("suspend coro:", caller);
+                return _callee;
             }
             T await_resume() const noexcept
             {
@@ -189,10 +219,14 @@ struct Task<void>
 {
     struct promise_type
     {
+        uint64_t coro_id = 0;
         Task get_return_object() {
-            return Task(std::coroutine_handle<promise_type>::from_promise(*this));
+            static uint64_t salt = 0;
+            auto coro = std::coroutine_handle<promise_type>::from_promise(*this);
+            coro_id = reinterpret_cast<uint64_t>(coro.address()) ^ (++salt);
+            return Task(coro);
         }
-        std::suspend_never initial_suspend() noexcept { return {}; }
+        std::suspend_always initial_suspend() noexcept { return {}; }
         FinalAwaiter final_suspend() noexcept { return {_caller}; }
         void return_void() {}
         void unhandled_exception() {std::terminate(); }
@@ -214,16 +248,23 @@ struct Task<void>
         debug_coro("destroy task for handle:", _callee);
     }
 
+    void detach()
+    {
+        _callee.resume();
+        _callee = nullptr;
+    }
+
     // to support co_await on Task
     auto operator co_await() const noexcept {
         struct Awaiter {
             std::coroutine_handle<promise_type> _callee;
             Awaiter(std::coroutine_handle<promise_type> handle) : _callee(handle) {}
             bool await_ready() const noexcept { return false; }
-            void await_suspend(std::coroutine_handle<> caller) noexcept
+            std::coroutine_handle<> await_suspend(std::coroutine_handle<> caller) noexcept
             {
                 _callee.promise()._caller = caller;
                 debug_coro("suspend coro:", caller);
+                return _callee;
             }
             void await_resume() const noexcept
             {

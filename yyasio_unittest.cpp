@@ -2,6 +2,7 @@
 #include <boost/test/unit_test.hpp>
 
 #include "yyasio.h"
+#include <array>
 #include <atomic>
 #include <thread>
 #include <chrono>
@@ -31,7 +32,7 @@ BOOST_AUTO_TEST_CASE(test_promise_basic)
 
     std::cout << "Test: starting coroutine\n";
     // Start the coroutine - it will suspend on co_await promise.wait()
-    wait_for_promise(promise, result);
+    wait_for_promise(promise, result).detach();
 
     std::cout << "Test: coroutine started, result = " << result.load() << "\n";
     // At this point, the coroutine is suspended, waiting for the promise
@@ -62,7 +63,7 @@ BOOST_AUTO_TEST_CASE(test_promise_multiple_resumes)
     std::vector<int> results;
 
     // Start the coroutine - it will wait in a loop
-    wait_for_promise_loop(promise, results, 3);
+    wait_for_promise_loop(promise, results, 3).detach();
 
     // Resume multiple times
     promise.resume(1);
@@ -106,7 +107,7 @@ BOOST_AUTO_TEST_CASE(test_openat)
     BOOST_REQUIRE_EQUAL(scheduler.init(16), YYASIO_OK);
 
     std::atomic<int> fd{-1};
-    open_file_coro(&scheduler, fd);
+    open_file_coro(&scheduler, fd).detach();
 
     std::thread runner([&scheduler]() { scheduler.run(); });
     runner.detach();
@@ -141,7 +142,7 @@ BOOST_AUTO_TEST_CASE(test_write)
     BOOST_REQUIRE_EQUAL(scheduler.init(16), YYASIO_OK);
 
     std::atomic<int> bytes_written{0};
-    write_file_coro(&scheduler, fd, bytes_written);
+    write_file_coro(&scheduler, fd, bytes_written).detach();
 
     std::thread runner([&scheduler]() { scheduler.run(); });
     runner.detach();
@@ -177,7 +178,7 @@ BOOST_AUTO_TEST_CASE(test_read)
 
     char buffer[256] = {0};
     std::atomic<int> bytes_read{0};
-    read_file_coro(&scheduler, fd, buffer, sizeof(buffer), bytes_read);
+    read_file_coro(&scheduler, fd, buffer, sizeof(buffer), bytes_read).detach();
 
     std::thread runner([&scheduler]() { scheduler.run(); });
     runner.detach();
@@ -211,7 +212,7 @@ BOOST_AUTO_TEST_CASE(test_close)
     BOOST_REQUIRE_EQUAL(scheduler.init(16), YYASIO_OK);
 
     std::atomic<int> close_result{-1};
-    close_file_coro(&scheduler, fd, close_result);
+    close_file_coro(&scheduler, fd, close_result).detach();
 
     std::thread runner([&scheduler]() { scheduler.run(); });
     runner.detach();
@@ -262,7 +263,7 @@ BOOST_AUTO_TEST_CASE(test_file_io_combined)
     BOOST_REQUIRE_EQUAL(scheduler.init(16), YYASIO_OK);
 
     std::atomic<bool> done{false};
-    file_io_combined_coro(&scheduler, done);
+    file_io_combined_coro(&scheduler, done).detach();
 
     std::thread runner([&scheduler]() { scheduler.run(); });
     runner.detach();
@@ -305,7 +306,7 @@ BOOST_AUTO_TEST_CASE(test_coroutine_return_value)
     std::atomic<int> result{0};
 
     // Start the parent coroutine - it will co_await the child
-    get_return_value(&scheduler, result);
+    get_return_value(&scheduler, result).detach();
 
     // Run scheduler in background thread (run() is blocking)
     std::thread runner([&scheduler]() {
@@ -347,7 +348,7 @@ BOOST_AUTO_TEST_CASE(test_timeout)
     std::atomic<long> elapsed_ns{0};
     long timeout_ns = 100'000'000; // 100ms
 
-    timeout_coro(&scheduler, timeout_ns, result, elapsed_ns);
+    timeout_coro(&scheduler, timeout_ns, result, elapsed_ns).detach();
 
     std::thread runner([&scheduler]() { scheduler.run(); });
     runner.detach();
@@ -361,6 +362,58 @@ BOOST_AUTO_TEST_CASE(test_timeout)
     BOOST_CHECK_EQUAL(result.load(), -ETIME);
     // Elapsed time should be at least 80% of the requested timeout
     BOOST_CHECK_GE(elapsed_ns.load(), timeout_ns * 8 / 10);
+}
+
+// ==================== CoroId Test ====================
+
+Task<uint64_t> get_sub_coro_id_test(Scheduler* scheduler)
+{
+    uint64_t id = co_await current_coro_id();
+    co_return id;
+}
+
+Task<void> coro_id_test_oro(Scheduler* scheduler, std::atomic<bool>& done,
+    std::array<uint64_t, 2>& parent_ids,
+    std::array<uint64_t, 2>& sub_ids)
+{
+    // Parent's coro_id should be the same on every call
+    parent_ids[0] = co_await current_coro_id();
+    parent_ids[1] = co_await current_coro_id();
+
+    // Each sub-coroutine should have a different coro_id
+    sub_ids[0] = co_await get_sub_coro_id_test(scheduler);
+    sub_ids[1] = co_await get_sub_coro_id_test(scheduler);
+
+    done.store(true);
+}
+
+BOOST_AUTO_TEST_CASE(test_coro_id)
+{
+    Scheduler scheduler;
+    BOOST_REQUIRE_EQUAL(scheduler.init(16), YYASIO_OK);
+
+    std::atomic<bool> done{false};
+    std::array<uint64_t, 2> parent_ids{0, 0};
+    std::array<uint64_t, 2> sub_ids{0, 0};
+
+    coro_id_test_oro(&scheduler, done, parent_ids, sub_ids).detach();
+
+    std::thread runner([&scheduler]() { scheduler.run(); });
+    runner.detach();
+
+    auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (!done.load() && std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+
+    BOOST_CHECK(done.load());
+    // Parent's coro_id should be consistent across multiple calls
+    BOOST_CHECK_EQUAL(parent_ids[0], parent_ids[1]);
+    // Different sub-coroutines should have different coro_ids
+    BOOST_CHECK_NE(sub_ids[0], sub_ids[1]);
+    // Sub-coroutine's coro_id should differ from parent's
+    BOOST_CHECK_NE(parent_ids[0], sub_ids[0]);
+    BOOST_CHECK_NE(parent_ids[1], sub_ids[1]);
 }
 
 BOOST_AUTO_TEST_SUITE_END()

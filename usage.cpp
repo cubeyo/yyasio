@@ -45,8 +45,8 @@ yyasio::Task<void> accept_connections(yyasio::Scheduler* scheduler, int listen_f
         inet_ntop(AF_INET, &(addr.sin_addr), ip_str.data(), INET_ADDRSTRLEN);
         std::cout << "Accepted connection: " << conn_fd << ", from:" << ip_str << ":" << ntohs(addr.sin_port) << "\n";
 
-        handle_client(scheduler, conn_fd);
-        cancel_after_3s(scheduler, conn_fd); // just demostrate how to cancel
+        handle_client(scheduler, conn_fd).detach();
+        cancel_after_3s(scheduler, conn_fd).detach(); // just demostrate how to cancel
     }
 }
 
@@ -115,7 +115,28 @@ yyasio::Task<void> run_simple_server(yyasio::Scheduler* scheduler, int listen_po
     bind(listen_fd, (sockaddr*)&addr, sizeof(addr));
     listen(listen_fd, SOMAXCONN);
 
-    return accept_connections(scheduler, listen_fd);
+    co_await accept_connections(scheduler, listen_fd);
+}
+
+yyasio::Task<uint64_t> get_sub_coro_id(yyasio::Scheduler* scheduler)
+{
+    std::cout << "enter sub coro\n";
+    uint64_t coro_id = co_await yyasio::current_coro_id();
+    std::cout << "sub coro id: " << coro_id << "\n";
+    co_return coro_id;
+}
+
+yyasio::Task<void> get_coro_id(yyasio::Scheduler* scheduler)
+{
+    while (true)
+    {
+        uint64_t coro_id = co_await yyasio::current_coro_id();
+        std::cout << "Parent coro ID: " << coro_id << "\n";
+        uint64_t sub_coro_id = co_await get_sub_coro_id(scheduler);
+        std::cout << "Sub coro ID: " << sub_coro_id << "\n";
+        struct __kernel_timespec ts = { .tv_sec = 1, .tv_nsec = 0 };
+        co_await yyasio::timeout(scheduler, &ts);
+    }
 }
 
 yyasio::Task<void> infinite_loop(yyasio::Promise<int>& promise)
@@ -134,7 +155,9 @@ yyasio::Task<void> tick_trigger(yyasio::Scheduler* scheduler, yyasio::Promise<in
     while (true)
     {
         struct __kernel_timespec ts = { .tv_sec = 1, .tv_nsec = 0 };
+        std::cout << "Wait for 1 second\n";
         co_await yyasio::timeout(scheduler, &ts);
+        std::cout << "Call resume\n";
         promise.resume(val++);
     }
 }
@@ -149,15 +172,17 @@ int main()
         std::terminate();
     }
 
-    // run_simple_server(&scheduler, 8080);
+    run_simple_server(&scheduler, 8080).detach();
 
-    timeout_trigger(&scheduler);
+    timeout_trigger(&scheduler).detach();
 
-    // visit_regular_file(&scheduler);
+    visit_regular_file(&scheduler).detach();
 
-    // yyasio::Promise<int> promise;
-    // infinite_loop(promise);
-    // tick_trigger(&scheduler, promise);
+    get_coro_id(&scheduler).detach();
+
+    yyasio::Promise<int> promise;
+    infinite_loop(promise).detach();
+    tick_trigger(&scheduler, promise).detach();
 
     // will block here
     scheduler.run();
