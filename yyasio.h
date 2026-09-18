@@ -29,6 +29,7 @@
 
 #define DEBUG 0
 #if DEBUG
+#include <iomanip>
 constexpr const char* _filename_only(const char* path) {
     const char* name = path;
     for (const char* p = path; *p; ++p) { if (*p == '/') name = p + 1; }
@@ -44,7 +45,7 @@ constexpr const char* _filename_only(const char* path) {
         strftime(_buf, sizeof(_buf), "%Y-%m-%d %H:%M:%S", &_tm); \
         std::cout << "[" << _buf << "." << std::setw(9) << std::setfill('0') << _ts.tv_nsec << "]" \
                   << " [" << _filename_only(__FILE__) << ":" << __LINE__ << "]" \
-                  << " [Coro] " << hint << std::hex << coro.address() << std::dec << "\n"; \
+                  << " [Coro] " << hint << std::hex << coro.address() << std::dec << "(" << reinterpret_cast<uint64_t>(coro.address()) << ")\n"; \
     } while(0)
 #else
 #define debug_coro(hint, coro) do {} while(0)
@@ -99,7 +100,7 @@ struct CoroIdAwaiter {
     bool await_ready() const noexcept { return false; }
     template<typename promise_type>
     bool await_suspend(std::coroutine_handle<promise_type> handle) noexcept {
-        id = handle.promise().coro_id;
+        id = reinterpret_cast<uint64_t>(handle.address());
         return false;
     }
     uint64_t await_resume() const noexcept { return id; }
@@ -145,11 +146,8 @@ struct Task
     struct promise_type
     {
         T result;
-        uint64_t coro_id = 0;
         Task get_return_object() {
-            static uint64_t salt = 0;
             auto coro = std::coroutine_handle<promise_type>::from_promise(*this);
-            coro_id = reinterpret_cast<uint64_t>(coro.address()) ^ (++salt);
             return Task(coro);
         }
         // always suspend on initializetion,
@@ -177,10 +175,7 @@ struct Task
 
     // Frame is self-destroyed in FinalAwaiter::await_suspend.
     // ~Task() is intentionally a no-op to support fire-and-forget usage.
-    ~Task()
-    {
-        debug_coro("destroy task for handle:", _callee);
-    }
+    ~Task() = default;
 
     void detach()
     {
@@ -220,11 +215,8 @@ struct Task<void>
 {
     struct promise_type
     {
-        uint64_t coro_id = 0;
         Task get_return_object() {
-            static uint64_t salt = 0;
             auto coro = std::coroutine_handle<promise_type>::from_promise(*this);
-            coro_id = reinterpret_cast<uint64_t>(coro.address()) ^ (++salt);
             return Task(coro);
         }
         std::suspend_always initial_suspend() noexcept { return {}; }
@@ -242,12 +234,7 @@ struct Task<void>
     }
     Task(Task&& other) noexcept : _callee(other._callee) { other._callee = nullptr; }
     Task& operator=(Task&&) = delete;
-    ~Task()
-    {
-        // Frame is self-destroyed in FinalAwaiter::await_suspend.
-        // ~Task() is intentionally a no-op to support fire-and-forget usage.
-        debug_coro("destroy task for handle:", _callee);
-    }
+    ~Task() = default;
 
     void detach()
     {
@@ -304,7 +291,7 @@ public:
         while (true)
         {
             batch_prepare_sqe();
-            // TODO: avoid waiting for single long io
+
             int submitted = io_uring_submit_and_wait(&ring, 1);
             if (submitted < 0)
             {
@@ -323,15 +310,27 @@ public:
             while (io_uring_peek_cqe(&ring, &cqe) == 0)
             {
                 // NOLINTNEXTLINE(cppcoreguidelines-pro-type-reinterpret-cast)
-                auto handle = std::coroutine_handle<>::from_address(reinterpret_cast<void*>(cqe->user_data)); 
-                debug_coro("io returned:", handle);
                 io_uring_cqe_seen(&ring, cqe);
-                auto it = coro_res.find(handle.address());
-                if (it != coro_res.end())
+                auto inflight_idx = cqe->user_data;
+                auto iter = inflight_map.find(inflight_idx);
+                if (iter == inflight_map.end())
                 {
-                    *it->second = cqe->res;
-                    coro_res.erase(it);
+                    // Duplicate CQE: the SQE already completed and the coroutine may
+                    // have been resumed/destroyed. Observed on WSL2 kernels where a
+                    // single connect SQE can deliver two or more CQEs.
+                    std::cerr << "WARNING: duplicate CQE for io_cnt=" << inflight_idx << "\n";
+                    continue;
                 }
+
+                auto [coro_addr, res_addr] = iter->second;
+                auto handle = std::coroutine_handle<>::from_address(reinterpret_cast<void*>(coro_addr));
+                inflight_map.erase(iter);
+                debug_coro("io returned:", handle);
+                if (res_addr)
+                {
+                    *res_addr = cqe->res;
+                }
+
                 handle.resume();
             }
         }
@@ -374,18 +373,18 @@ private:
 
             debug_coro("prepare sqe for coro:", coro);
             prep_sqe_fn(sqe);
-            io_uring_sqe_set_data(sqe, coro.address());
-            if (res_addr)
-            {
-                coro_res[coro.address()] = res_addr;
-            }
+            inflight_map[io_cnt] = std::make_tuple(coro.address(), res_addr);
+            io_uring_sqe_set_data(sqe, reinterpret_cast<void*>(static_cast<uintptr_t>(io_cnt)));
+            io_cnt++;
             pending_queue.pop();
         }
     }
 
     io_uring ring {};
     std::queue<std::tuple<std::coroutine_handle<>, PrepSqeClosure, int*, struct timespec>> pending_queue;
-    std::unordered_map<void*, int*> coro_res; // maps coroutine address to its result address
+    uint64_t io_cnt = 0;
+    std::unordered_map<uint64_t, std::tuple<void*, int*>> inflight_map; // io_idx -> <coro addr, result addr>
+
     uint64_t tot_sched_time = 0;
     uint64_t tot_sched_count = 0;
     uint64_t tot_submit_items = 0;
