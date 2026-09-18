@@ -6,6 +6,7 @@
 #include <coroutine>
 #include <functional>
 #include <queue>
+#include <sys/socket.h>
 #include <unordered_map>
 #include <liburing.h>
 
@@ -489,6 +490,22 @@ inline UringAwaiter close(Scheduler* scheduler, int fd)
 {
     PrepSqeClosure prepare_sqe_cb = [fd](io_uring_sqe* sqe) -> void {
         io_uring_prep_close(sqe, fd);
+    };
+    return UringAwaiter{ scheduler, prepare_sqe_cb };
+}
+
+inline UringAwaiter connect(Scheduler* scheduler, int fd, const struct sockaddr *addr, socklen_t len)
+{
+    PrepSqeClosure prepare_sqe_cb = [fd, addr, len](io_uring_sqe* sqe) -> void {
+        io_uring_prep_connect(sqe, fd, addr, len);
+    };
+    return UringAwaiter{ scheduler, prepare_sqe_cb };
+}
+
+inline UringAwaiter listen(Scheduler* scheduler, int fd, int backlog = SOMAXCONN)
+{
+    PrepSqeClosure prepare_sqe_cb = [fd, backlog](io_uring_sqe* sqe) -> void {
+        io_uring_prep_listen(sqe, fd, backlog);
     };
     return UringAwaiter{ scheduler, prepare_sqe_cb };
 }

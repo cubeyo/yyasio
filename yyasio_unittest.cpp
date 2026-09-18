@@ -10,6 +10,9 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include <sys/stat.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
+#include <arpa/inet.h>
 
 using namespace yyasio;
 
@@ -414,6 +417,176 @@ BOOST_AUTO_TEST_CASE(test_coro_id)
     // Sub-coroutine's coro_id should differ from parent's
     BOOST_CHECK_NE(parent_ids[0], sub_ids[0]);
     BOOST_CHECK_NE(parent_ids[1], sub_ids[1]);
+}
+
+// ==================== Connect Test ====================
+
+// Server coroutine: accept one connection and read data
+Task<void> accept_one_connection(Scheduler* scheduler, int listen_fd, std::atomic<bool>& accepted, char* buf, size_t buf_size, std::atomic<int>& bytes_read)
+{
+    struct sockaddr_in addr{};
+    socklen_t len = sizeof(addr);
+    int conn_fd = co_await accept(scheduler, listen_fd, reinterpret_cast<sockaddr*>(&addr), &len);
+    std::cout << "accept_one_connection: accepted conn_fd = " << conn_fd << "\n";
+    accepted.store(true);
+
+    int ret = co_await read(scheduler, conn_fd, buf, buf_size);
+    std::cout << "accept_one_connection: read " << ret << " bytes\n";
+    bytes_read.store(ret);
+    ::close(conn_fd);
+}
+
+// Client coroutine: connect to server and send data
+Task<void> connect_and_send_test(Scheduler* scheduler, int port, std::atomic<int>& connect_result, std::atomic<int>& write_result)
+{
+    // Wait for server to be ready
+    struct __kernel_timespec ts = { .tv_sec = 0, .tv_nsec = 100'000'000 }; // 100ms
+    co_await timeout(scheduler, &ts);
+
+    int fd = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0);
+    if (fd < 0)
+    {
+        std::cerr << "connect_and_send_test: socket() failed\n";
+        connect_result.store(-1);
+        co_return;
+    }
+
+    struct sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(port);
+    inet_pton(AF_INET, "127.0.0.1", &addr.sin_addr);
+
+    std::cout << "connect_and_send_test: connecting to 127.0.0.1:" << port << "\n";
+    int ret = co_await connect(scheduler, fd, reinterpret_cast<struct sockaddr*>(&addr), sizeof(addr));
+    std::cout << "connect_and_send_test: connect ret = " << ret << "\n";
+    connect_result.store(ret);
+
+    if (ret < 0)
+    {
+        ::close(fd);
+        co_return;
+    }
+
+    const char* msg = "hello connect test";
+    int written = co_await write(scheduler, fd, msg, strlen(msg));
+    std::cout << "connect_and_send_test: wrote " << written << " bytes\n";
+    write_result.store(written);
+    ::close(fd);
+}
+
+BOOST_AUTO_TEST_CASE(test_connect)
+{
+    // Create listening socket
+    int listen_fd = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0);
+    BOOST_REQUIRE(listen_fd > 0);
+
+    int opt = 1;
+    setsockopt(listen_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+
+    struct sockaddr_in server_addr{};
+    server_addr.sin_family = AF_INET;
+    server_addr.sin_addr.s_addr = INADDR_ANY;
+    server_addr.sin_port = htons(18080); // Use a different port to avoid conflict
+
+    BOOST_REQUIRE_EQUAL(bind(listen_fd, (sockaddr*)&server_addr, sizeof(server_addr)), 0);
+    BOOST_REQUIRE_EQUAL(listen(listen_fd, SOMAXCONN), 0);
+
+    Scheduler scheduler;
+    BOOST_REQUIRE_EQUAL(scheduler.init(16), YYASIO_OK);
+
+    std::atomic<bool> accepted{false};
+    std::atomic<int> bytes_read{0};
+    char read_buf[256] = {0};
+
+    std::atomic<int> connect_result{-1};
+    std::atomic<int> write_result{0};
+
+    // Start server coroutine
+    accept_one_connection(&scheduler, listen_fd, accepted, read_buf, sizeof(read_buf), bytes_read).detach();
+
+    // Start client coroutine
+    connect_and_send_test(&scheduler, 18080, connect_result, write_result).detach();
+
+    std::thread runner([&scheduler]() { scheduler.run(); });
+    runner.detach();
+
+    // Wait for both to complete (including read operation)
+    auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while ((!accepted.load() || connect_result.load() == -1 || bytes_read.load() == 0) && std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+
+    // Verify connection succeeded
+    BOOST_CHECK(accepted.load());
+    BOOST_CHECK_EQUAL(connect_result.load(), 0);
+    BOOST_CHECK_EQUAL(write_result.load(), (int)strlen("hello connect test"));
+    BOOST_CHECK_EQUAL(bytes_read.load(), (int)strlen("hello connect test"));
+    BOOST_CHECK_EQUAL(std::string(read_buf, bytes_read.load()), "hello connect test");
+
+    ::close(listen_fd);
+}
+
+// ==================== Listen Test ====================
+
+// Helper coroutine: async listen and verify
+Task<void> listen_coro(Scheduler* scheduler, int fd, std::atomic<int>& result)
+{
+    int ret = co_await listen(scheduler, fd);
+    std::cout << "listen_coro: ret = " << ret << "\n";
+    result.store(ret);
+}
+
+BOOST_AUTO_TEST_CASE(test_listen)
+{
+    // Create and bind socket first
+    int listen_fd = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0);
+    BOOST_REQUIRE(listen_fd > 0);
+
+    int opt = 1;
+    setsockopt(listen_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+
+    struct sockaddr_in server_addr{};
+    server_addr.sin_family = AF_INET;
+    server_addr.sin_addr.s_addr = INADDR_ANY;
+    server_addr.sin_port = htons(18081);
+
+    BOOST_REQUIRE_EQUAL(bind(listen_fd, (sockaddr*)&server_addr, sizeof(server_addr)), 0);
+
+    Scheduler scheduler;
+    BOOST_REQUIRE_EQUAL(scheduler.init(16), YYASIO_OK);
+
+    std::atomic<int> listen_result{-1};
+    listen_coro(&scheduler, listen_fd, listen_result).detach();
+
+    std::thread runner([&scheduler]() { scheduler.run(); });
+    runner.detach();
+
+    auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (listen_result.load() == -1 && std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+
+    // listen() returns 0 on success
+    BOOST_CHECK_EQUAL(listen_result.load(), 0);
+
+    // Verify we can connect to it
+    if (listen_result.load() == 0)
+    {
+        int client_fd = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0);
+        BOOST_REQUIRE(client_fd > 0);
+
+        struct sockaddr_in addr{};
+        addr.sin_family = AF_INET;
+        addr.sin_port = htons(18081);
+        inet_pton(AF_INET, "127.0.0.1", &addr.sin_addr);
+
+        int ret = ::connect(client_fd, (struct sockaddr*)&addr, sizeof(addr));
+        // Non-blocking connect returns -1 with EINPROGRESS or 0 on success
+        BOOST_CHECK(ret == 0 || (ret == -1 && errno == EINPROGRESS));
+
+        ::close(client_fd);
+    }
+    ::close(listen_fd);
 }
 
 BOOST_AUTO_TEST_SUITE_END()

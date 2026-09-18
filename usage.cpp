@@ -104,16 +104,35 @@ yyasio::Task<void> visit_regular_file(yyasio::Scheduler* scheduler)
 yyasio::Task<void> run_simple_server(yyasio::Scheduler* scheduler, int listen_port)
 {
     int listen_fd = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0);
+    if (listen_fd < 0)
+    {
+        std::cerr << "Create socket failed\n";
+        co_return;
+    }
+
     int opt = 1;
     setsockopt(listen_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
 
-    sockaddr_in addr;
+    sockaddr_in addr{};
     addr.sin_family = AF_INET;
     addr.sin_addr.s_addr = INADDR_ANY;
-    addr.sin_port = htons(8080);
+    addr.sin_port = htons(listen_port);
 
-    bind(listen_fd, (sockaddr*)&addr, sizeof(addr));
-    listen(listen_fd, SOMAXCONN);
+    if (bind(listen_fd, (sockaddr*)&addr, sizeof(addr)) < 0)
+    {
+        std::cerr << "Bind failed\n";
+        close(listen_fd);
+        co_return;
+    }
+
+    int ret = co_await yyasio::listen(scheduler, listen_fd);
+    if (ret < 0)
+    {
+        std::cerr << "Listen on port " << listen_port << " failed, ret = " << ret << "\n";
+        close(listen_fd);
+        co_return;
+    }
+    std::cout << "Server listening on port " << listen_port << ", fd = " << listen_fd << "\n";
 
     co_await accept_connections(scheduler, listen_fd);
 }
@@ -162,6 +181,41 @@ yyasio::Task<void> tick_trigger(yyasio::Scheduler* scheduler, yyasio::Promise<in
     }
 }
 
+yyasio::Task<void> connect_and_send(yyasio::Scheduler* scheduler)
+{
+    // wait for server to start
+    __kernel_timespec ts = { .tv_sec = 1, .tv_nsec = 0 };
+    co_await yyasio::timeout(scheduler, &ts);
+
+    int fd = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0);
+    if (fd < 0)
+    {
+        std::cerr << "Create socket failed\n";
+        co_return;
+    }
+
+    struct sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(8080);
+    inet_pton(AF_INET, "127.0.0.1", &addr.sin_addr);
+
+    std::cout << "Connecting to 127.0.0.1:8080...\n";
+    int ret = co_await yyasio::connect(scheduler, fd, reinterpret_cast<struct sockaddr*>(&addr), sizeof(addr));
+    if (ret < 0)
+    {
+        std::cerr << "Connect failed, ret = " << ret << "\n";
+        close(fd);
+        co_return;
+    }
+    std::cout << "Connected successfully, fd = " << fd << "\n";
+
+    std::string msg = "hello from connect_and_send";
+    int bytes_written = co_await yyasio::write(scheduler, fd, msg.data(), msg.size(), 0);
+    std::cout << "Sent " << bytes_written << " bytes: " << msg << "\n";
+
+    close(fd);
+}
+
 int main()
 {
     yyasio::Scheduler scheduler;
@@ -183,6 +237,8 @@ int main()
     yyasio::Promise<int> promise;
     infinite_loop(promise).detach();
     tick_trigger(&scheduler, promise).detach();
+
+    connect_and_send(&scheduler).detach();
 
     // will block here
     scheduler.run();
