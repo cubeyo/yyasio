@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstdint>
 #include <cstring>
 #include <ctime>
 #include <iostream>
@@ -9,6 +10,187 @@
 #include <sys/socket.h>
 #include <unordered_map>
 #include <liburing.h>
+#include <variant>
+
+#ifndef PRINT_STACK_ON_EXCEPTION
+#define PRINT_STACK_ON_EXCEPTION 0
+#endif
+
+#if PRINT_STACK_ON_EXCEPTION
+
+#include <libunwind.h>
+#include <cxxabi.h>
+#include <sstream>
+
+namespace yyasio
+{
+
+namespace detail
+{
+struct CoroDebugInfo
+{
+    void* caller = nullptr;
+    std::string proc;
+    unw_word_t ip = 0;
+    unw_word_t off = 0;
+
+    CoroDebugInfo()
+    {
+        proc.resize(256);
+    }
+};
+
+inline void get_debuginfo(CoroDebugInfo* hint)
+{
+    unw_cursor_t cursor;
+    unw_context_t ctx;
+
+    unw_getcontext(&ctx);
+    unw_init_local(&cursor, &ctx);
+
+    if (unw_step(&cursor) <= 0)
+    {
+        return;
+    }
+
+    if (unw_step(&cursor) > 0)
+    {
+        unw_get_reg(&cursor, UNW_REG_IP, &hint->ip);
+        unw_get_proc_name(&cursor, hint->proc.data(), hint->proc.size(), &hint->off);
+    }
+}
+
+inline void print_hardware_stack()
+{
+    unw_context_t ctx;
+    unw_cursor_t cursor;
+
+    unw_getcontext(&ctx);
+    unw_init_local(&cursor, &ctx);
+
+    std::cerr << "==== Hardware stack (libunwind) ====\n";
+
+    while (unw_step(&cursor) > 0)
+    {
+        unw_word_t ip, off;
+        char sym[256]{};
+        unw_get_reg(&cursor, UNW_REG_IP, &ip);
+
+        int rc = unw_get_proc_name(&cursor, sym, sizeof(sym), &off);
+        if (rc != 0)
+        {
+            std::cerr << "0x" << std::hex << ip << " : ???\n";
+            continue;
+        }
+
+        // demangle c++符号
+        int status;
+        char* demangled = abi::__cxa_demangle(sym, nullptr, nullptr, &status);
+        if (status == 0 && demangled)
+        {
+            std::cerr << "0x" << std::hex << ip << " : " << demangled << " +0x" << off << "\n";
+            free(demangled);
+        }
+        else
+        {
+            std::cerr << "0x" << std::hex << ip << " : " << sym << " +0x" << off << "\n";
+        }
+    }
+    std::cerr << "====================================\n\n";
+}
+
+class DebugInfoStore
+{
+public:
+    static void store_debuginfo(void* coro_addr, detail::CoroDebugInfo debuginfo)
+    {
+        s_debuginfo[coro_addr] = std::move(debuginfo);
+    }
+
+    static void set_caller(void* callee, void* caller)
+    {
+        auto iter = s_debuginfo.find(callee);
+        if (iter != s_debuginfo.end())
+        {
+            iter->second.caller = caller;
+        }
+    }
+
+    static void remove_coro(void* coro_addr)
+    {
+        s_debuginfo.erase(coro_addr);
+    }
+
+    inline static std::unordered_map<void*, detail::CoroDebugInfo> s_debuginfo; // maps from coroutine address to frame hint
+};
+
+inline std::string get_demangle_debuginfo(const detail::CoroDebugInfo& debuginfo)
+{
+    int status;
+    std::stringstream os;
+    char* demangled = abi::__cxa_demangle(debuginfo.proc.c_str(), nullptr, nullptr, &status);
+    if (status == 0 && demangled)
+    {
+        os << "0x" << std::hex << debuginfo.ip << " : " << demangled << " +0x" << debuginfo.off;
+        free(demangled);
+    }
+    else
+    {
+        os << "0x" << std::hex << debuginfo.ip << " : " << debuginfo.proc << " +0x" << debuginfo.off;
+    }
+    return os.str();
+}
+
+inline void print_coroutine_stack(void* coro_addr)
+{
+    std::cerr << "==== Coroutine stack ====\n";
+    while (coro_addr)
+    {
+        const auto iter = detail::DebugInfoStore::s_debuginfo.find(coro_addr);
+        if (iter == detail::DebugInfoStore::s_debuginfo.end())
+            break;
+
+        std::cerr << detail::get_demangle_debuginfo(iter->second) << "\n";
+        coro_addr = iter->second.caller;
+    }
+}
+
+} // namespace detail
+
+} // namespace yyasio
+
+#else // !PRINT_STACKTRACE_ON_EXCEPTION
+
+namespace yyasio
+{
+
+namespace detail
+{
+struct CoroDebugInfo {};
+
+inline void get_debuginfo(CoroDebugInfo* hint) {}
+
+inline void print_hardware_stack()
+{
+    std::cerr << "Dump hardware stack disabled, compile with -DPRINT_CORO_STACK_ON_EXCEPTION=1\n";
+}
+
+class DebugInfoStore
+{
+public:
+    static void store_debuginfo(void* coro_addr, detail::CoroDebugInfo debuginfo) {}
+    static void set_caller(void* callee, void* caller) {}
+    static void remove_coro(void* coro_addr) {}
+};
+
+inline void print_coroutine_stack(void* coro_addr)
+{
+    std::cerr << "Dump coro stack disabled, compile with -DPRINT_CORO_STACK_ON_EXCEPTION=1\n";
+}
+}
+
+}
+#endif
 
 // This macro is not defined by liburing <= 2.0
 #ifndef IO_URING_VERSION_MAJOR
@@ -27,8 +209,8 @@
 #endif
 #endif
 
-#define DEBUG 0
-#if DEBUG
+#define PRINT_CORO_RUNTIMEINFO 0
+#if PRINT_CORO_RUNTIMEINFO
 #include <iomanip>
 constexpr const char* _filename_only(const char* path) {
     const char* name = path;
@@ -61,28 +243,30 @@ enum ErrorCode
     YYASIO_SUBMIT_ERROR
 };
 
+// One coroutine can co_await on this Event
+// and another coroutine can set it to wakeup the first coroutine
 template <typename T>
-class Promise
+class Event
 {
 public:
     struct Awaiter
     {
-        Awaiter(Promise* promise): _promise(promise) {}
+        Awaiter(Event* event): _event(event) {}
         bool await_ready() const noexcept { return false; }
         bool await_suspend(std::coroutine_handle<> handle) noexcept {
-            _promise->_coro = handle;
+            _event->_coro = handle;
             return true;
         }
         T await_resume() const noexcept {
-            _promise->_coro = nullptr;
-            return _promise->_value;
+            _event->_coro = nullptr;
+            return _event->_value;
         }
-        Promise* _promise;
+        Event* _event;
     };
 
     Awaiter wait() { return Awaiter(this); }
 
-    void resume(T value)
+    void set(T value)
     {
         if (_coro)
         {
@@ -95,6 +279,8 @@ private:
     T _value;
 };
 
+namespace detail
+{
 struct CoroIdAwaiter {
     uint64_t id = 0;
     bool await_ready() const noexcept { return false; }
@@ -106,9 +292,10 @@ struct CoroIdAwaiter {
     uint64_t await_resume() const noexcept { return id; }
 };
 
-inline CoroIdAwaiter current_coro_id()
+} // namespace detail
+inline detail::CoroIdAwaiter current_coro_id()
 {
-    return CoroIdAwaiter();
+    return detail::CoroIdAwaiter();
 }
 
 struct FinalAwaiter {
@@ -133,6 +320,7 @@ struct FinalAwaiter {
              * just destroy the frame here.
              */
             debug_coro("destroy coro in final_awaiter(fire-and-forget mode):", handle);
+            detail::DebugInfoStore::remove_coro(handle.address());
             handle.destroy();
             return std::noop_coroutine(); // return noop coroutine to avoid resuming null handle
         }
@@ -140,28 +328,49 @@ struct FinalAwaiter {
     void await_resume() const noexcept { }
 };
 
+// Helper base to provide return_value or return_void via specialization.
+// GCC 11 doesn't support requires clauses to filter member functions in class templates.
+template<typename T>
+struct promise_return_base
+{
+    T result;
+    void return_value(T value) { result = value; }
+};
+
+template<>
+struct promise_return_base<void>
+{
+    std::monostate result;
+    void return_void() {}
+};
+
 template<typename T>
 struct Task
 {
-    struct promise_type
+    struct promise_type: public promise_return_base<T>
     {
-        T result;
-        Task get_return_object() {
-            auto coro = std::coroutine_handle<promise_type>::from_promise(*this);
-            return Task(coro);
-        }
-        // always suspend on initializetion,
-        // will be resumed in either case:
-        // 1. caller co_await on this task, will resume on caller's await_suspend
-        // 2. caller fire-and-forget, will resume on detach() called
         std::suspend_always initial_suspend() noexcept { return {}; }
         FinalAwaiter final_suspend() noexcept { return {_caller}; }
-        void return_value(T value)
-        {
-            result = value;
+        Task get_return_object() {
+            auto coro = std::coroutine_handle<promise_type>::from_promise(*this);
+
+            // This is the only position we can get coroutine's address
+            // But we still cannot get parent coroutine's address here
+            // Parent coroutine's address will be updated when co_await called (via await_suspend)
+            detail::CoroDebugInfo debug_info;
+            get_debuginfo(&debug_info);
+            detail::DebugInfoStore::store_debuginfo(coro.address(), std::move(debug_info));
+            return Task(coro);
         }
-        void unhandled_exception() {std::terminate(); }
-        ~promise_type() = default;
+
+        void unhandled_exception() noexcept {
+            auto coro = std::coroutine_handle<promise_type>::from_promise(*this);
+            detail::print_hardware_stack();
+            detail::print_coroutine_stack(coro.address());
+
+            std::terminate();
+        }
+        
         std::coroutine_handle<> _caller;
     };
 
@@ -192,72 +401,27 @@ struct Task
             std::coroutine_handle<> await_suspend(std::coroutine_handle<> caller) noexcept
             {
                 _callee.promise()._caller = caller;
+                detail::DebugInfoStore::set_caller(_callee.address(), caller.address());
                 debug_coro("suspend coro:", caller);
                 return _callee;
             }
-            T await_resume() const noexcept
+
+            T await_resume() const noexcept requires (!std::same_as<T, void>)
             {
                 // awaiter inside parent's frame,
                 // can safely destroy sub coroutine's frame here
                 debug_coro("subcoro finished:", _callee);
-                T result = _callee.promise().result;
+                auto result = _callee.promise().result;
                 debug_coro("destroy coro:", _callee);
+                detail::DebugInfoStore::remove_coro(_callee.address());
                 _callee.destroy();
-                return result;
+                return static_cast<T>(result);
             }
-        };
-        return Awaiter(_callee);
-    }
-};
-
-template<>
-struct Task<void>
-{
-    struct promise_type
-    {
-        Task get_return_object() {
-            auto coro = std::coroutine_handle<promise_type>::from_promise(*this);
-            return Task(coro);
-        }
-        std::suspend_always initial_suspend() noexcept { return {}; }
-        FinalAwaiter final_suspend() noexcept { return {_caller}; }
-        void return_void() {}
-        void unhandled_exception() {std::terminate(); }
-        ~promise_type() = default;
-        std::coroutine_handle<> _caller; // will set value on await_suspend
-    };
-
-    std::coroutine_handle<promise_type> _callee = nullptr;
-    Task(std::coroutine_handle<promise_type> handle) : _callee(handle)
-    {
-        debug_coro("create coro for void task:", _callee);
-    }
-    Task(Task&& other) noexcept : _callee(other._callee) { other._callee = nullptr; }
-    Task& operator=(Task&&) = delete;
-    ~Task() = default;
-
-    void detach()
-    {
-        _callee.resume();
-        _callee = nullptr;
-    }
-
-    // to support co_await on Task
-    auto operator co_await() const noexcept {
-        struct Awaiter {
-            std::coroutine_handle<promise_type> _callee;
-            Awaiter(std::coroutine_handle<promise_type> handle) : _callee(handle) {}
-            bool await_ready() const noexcept { return false; }
-            std::coroutine_handle<> await_suspend(std::coroutine_handle<> caller) noexcept
-            {
-                _callee.promise()._caller = caller;
-                debug_coro("suspend coro:", caller);
-                return _callee;
-            }
-            void await_resume() const noexcept
+            void await_resume() const noexcept requires std::same_as<T, void>
             {
                 debug_coro("subcoro finished:", _callee);
                 debug_coro("destroy coro:", _callee);
+                detail::DebugInfoStore::remove_coro(_callee.address());
                 _callee.destroy();
             }
         };
@@ -271,7 +435,9 @@ class Scheduler
 {
 public:
     ErrorCode init(size_t entries) {
-        if (io_uring_queue_init(entries, &ring, 0) < 0)
+        // These two flags are supported by kernel >= 6.0
+        if (io_uring_queue_init(entries, &ring, IORING_SETUP_SINGLE_ISSUER|IORING_SETUP_DEFER_TASKRUN) < 0 &&
+            io_uring_queue_init(entries, &ring, 0) < 0)
         {
             return YYASIO_INIT_ERROR;
         }
@@ -298,10 +464,6 @@ public:
                 std::cerr << "io_uring_submit_and_wait failed:, ret = " << submitted << "\n";
                 return YYASIO_SUBMIT_ERROR;
             }
-            else if (submitted == 0)
-            {
-                std::cerr << "WARNING: io_uring_submit_and_wait returned 0 (no SQEs submitted), pending_queue.size=" << pending_queue.size() << "\n";
-            }
 
             tot_submit_items += submitted;
             tot_submit_count += 1;
@@ -309,16 +471,17 @@ public:
             io_uring_cqe* cqe = nullptr;
             while (io_uring_peek_cqe(&ring, &cqe) == 0)
             {
-                // NOLINTNEXTLINE(cppcoreguidelines-pro-type-reinterpret-cast)
+                auto inflight_idx = io_uring_cqe_get_data64(cqe);
+                int cqe_res = cqe->res;
                 io_uring_cqe_seen(&ring, cqe);
-                auto inflight_idx = cqe->user_data;
+
                 auto iter = inflight_map.find(inflight_idx);
                 if (iter == inflight_map.end())
                 {
+                    std::cerr << "duplicate cqe for index = " << inflight_idx << "\n";
                     // Duplicate CQE: the SQE already completed and the coroutine may
-                    // have been resumed/destroyed. Observed on WSL2 kernels where a
-                    // single connect SQE can deliver two or more CQEs.
-                    std::cerr << "WARNING: duplicate CQE for io_cnt=" << inflight_idx << "\n";
+                    // have been resumed/destroyed. Skip this CQE and continue
+                    // processing the remaining ones.
                     continue;
                 }
 
@@ -328,7 +491,7 @@ public:
                 debug_coro("io returned:", handle);
                 if (res_addr)
                 {
-                    *res_addr = cqe->res;
+                    *res_addr = cqe_res;
                 }
 
                 handle.resume();
@@ -359,7 +522,11 @@ private:
             auto* sqe = io_uring_get_sqe(&ring);
             if (!sqe)
             {
-                std::cerr << "WARNING: io_uring_get_sqe returned NULL! pending_queue.size=" << pending_queue.size() << "\n";
+                std::cerr << "WARNING: io_uring_get_sqe returned NULL! pending_queue.size="
+                          << pending_queue.size()
+                          << ", ring_entries=" << ring.sq.ring_entries
+                          << ", khead=" << *ring.sq.khead
+                          << ", ktail=" << *ring.sq.ktail << "\n";
                 break;
             }
             auto [coro, prep_sqe_fn, res_addr, enter_ts] = pending_queue.front();
@@ -372,9 +539,10 @@ private:
             tot_sched_count++;
 
             debug_coro("prepare sqe for coro:", coro);
+            memset(sqe, 0, sizeof(*sqe)); // ensure SQE is clean before prep
             prep_sqe_fn(sqe);
             inflight_map[io_cnt] = std::make_tuple(coro.address(), res_addr);
-            io_uring_sqe_set_data(sqe, reinterpret_cast<void*>(static_cast<uintptr_t>(io_cnt)));
+            io_uring_sqe_set_data64(sqe, io_cnt);
             io_cnt++;
             pending_queue.pop();
         }
@@ -455,7 +623,7 @@ inline UringAwaiter write(Scheduler* scheduler, int fd, const void* buffer, size
 }
 
 // for kernel <= 5.9, time_spec should be valid until the operation completes
-inline UringAwaiter timeout(Scheduler* scheduler, struct __kernel_timespec* time_spec, unsigned int count = 0, unsigned int flags = 0)
+inline UringAwaiter timeout(Scheduler* scheduler, struct __kernel_timespec* time_spec, unsigned int count = 1, unsigned int flags = 0)
 {
     PrepSqeClosure prepare_sqe_cb = [time_spec, count, flags](io_uring_sqe* sqe) -> void {
         io_uring_prep_timeout(sqe, time_spec, count, flags);

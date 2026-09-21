@@ -10,11 +10,14 @@ add_compile_options(-g -O0 -fsanitize=address -fsanitize=undefined)
 add_link_options(-fsanitize=address -fsanitize=undefined)
 
 add_executable(usage usage.cpp)
-target_link_libraries(usage PRIVATE uring)
+target_link_libraries(usage PRIVATE uring unwind unwind-x86_64)
+
+add_executable(demo_exception_stack_trace demo_exception_stack_trace.cpp)
+target_link_libraries(demo_exception_stack_trace PRIVATE uring unwind unwind-x86_64)
 
 option(BUILD_TEST "Build unit tests" OFF)
 if(BUILD_TEST)
     find_package(Boost REQUIRED COMPONENTS unit_test_framework)
     add_executable(yyasio_unittest yyasio_unittest.cpp)
-    target_link_libraries(yyasio_unittest PRIVATE uring Boost::unit_test_framework)
+    target_link_libraries(yyasio_unittest PRIVATE uring unwind unwind-x86_64 Boost::unit_test_framework)
 endif()

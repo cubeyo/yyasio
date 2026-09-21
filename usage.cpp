@@ -158,17 +158,17 @@ yyasio::Task<void> get_coro_id(yyasio::Scheduler* scheduler)
     }
 }
 
-yyasio::Task<void> infinite_loop(yyasio::Promise<int>& promise)
+yyasio::Task<void> infinite_loop(yyasio::Event<int>& event)
 {
     while (true)
     {
-        std::cout << "Wait for promise \n";
-        int val = co_await promise.wait();
-        std::cout << "Promise triggered with value: " << val << "\n";
+        std::cout << "Wait for event \n";
+        int val = co_await event.wait();
+        std::cout << "Event triggered with value: " << val << "\n";
     }
 }
 
-yyasio::Task<void> tick_trigger(yyasio::Scheduler* scheduler, yyasio::Promise<int>& promise)
+yyasio::Task<void> tick_trigger(yyasio::Scheduler* scheduler, yyasio::Event<int>& event)
 {
     int val = 0;
     while (true)
@@ -177,7 +177,7 @@ yyasio::Task<void> tick_trigger(yyasio::Scheduler* scheduler, yyasio::Promise<in
         std::cout << "Wait for 1 second\n";
         co_await yyasio::timeout(scheduler, &ts);
         std::cout << "Call resume\n";
-        promise.resume(val++);
+        event.set(val++);
     }
 }
 
@@ -234,9 +234,9 @@ int main()
 
     get_coro_id(&scheduler).detach();
 
-    yyasio::Promise<int> promise;
-    infinite_loop(promise).detach();
-    tick_trigger(&scheduler, promise).detach();
+    yyasio::Event<int> event;
+    infinite_loop(event).detach();
+    tick_trigger(&scheduler, event).detach();
 
     connect_and_send(&scheduler).detach();
 

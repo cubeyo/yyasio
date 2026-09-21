@@ -18,66 +18,66 @@ using namespace yyasio;
 
 BOOST_AUTO_TEST_SUITE(YYasioTests)
 
-// Helper coroutine that waits on a promise and stores the result
-Task<void> wait_for_promise(Promise<int>& promise, std::atomic<int>& result)
+// Helper coroutine that waits on a event and stores the result
+Task<void> wait_for_event(Event<int>& event, std::atomic<int>& result)
 {
-    std::cout << "Coroutine: about to wait for promise\n";
-    int val = co_await promise.wait();
+    std::cout << "Coroutine: about to wait for event\n";
+    int val = co_await event.wait();
     std::cout << "Coroutine: got value " << val << "\n";
     result.store(val);
     std::cout << "Coroutine: stored value, about to return\n";
 }
 
-BOOST_AUTO_TEST_CASE(test_promise_basic)
+BOOST_AUTO_TEST_CASE(test_event_basic)
 {
-    Promise<int> promise;
+    Event<int> event;
     std::atomic<int> result{-1};
 
     std::cout << "Test: starting coroutine\n";
-    // Start the coroutine - it will suspend on co_await promise.wait()
-    wait_for_promise(promise, result).detach();
+    // Start the coroutine - it will suspend on co_await event.wait()
+    wait_for_event(event, result).detach();
 
     std::cout << "Test: coroutine started, result = " << result.load() << "\n";
-    // At this point, the coroutine is suspended, waiting for the promise
+    // At this point, the coroutine is suspended, waiting for the event
     BOOST_CHECK_EQUAL(result.load(), -1);
 
-    std::cout << "Test: about to resume promise\n";
-    // Resume the coroutine by fulfilling the promise
-    promise.resume(42);
+    std::cout << "Test: about to resume event\n";
+    // Resume the coroutine by fulfilling the event
+    event.set(42);
 
-    std::cout << "Test: promise resumed, result = " << result.load() << "\n";
+    std::cout << "Test: event resumed, result = " << result.load() << "\n";
     // The coroutine should have resumed and stored the value
     BOOST_CHECK_EQUAL(result.load(), 42);
 }
 
 // Helper coroutine for testing multiple resumes
-Task<void> wait_for_promise_loop(Promise<int>& promise, std::vector<int>& results, int count)
+Task<void> wait_for_event_loop(Event<int>& event, std::vector<int>& results, int count)
 {
     for (int i = 0; i < count; ++i)
     {
-        int val = co_await promise.wait();
+        int val = co_await event.wait();
         results.push_back(val);
     }
 }
 
-BOOST_AUTO_TEST_CASE(test_promise_multiple_resumes)
+BOOST_AUTO_TEST_CASE(test_event_multiple_resumes)
 {
-    Promise<int> promise;
+    Event<int> event;
     std::vector<int> results;
 
     // Start the coroutine - it will wait in a loop
-    wait_for_promise_loop(promise, results, 3).detach();
+    wait_for_event_loop(event, results, 3).detach();
 
     // Resume multiple times
-    promise.resume(1);
+    event.set(1);
     BOOST_CHECK_EQUAL(results.size(), 1);
     BOOST_CHECK_EQUAL(results[0], 1);
 
-    promise.resume(2);
+    event.set(2);
     BOOST_CHECK_EQUAL(results.size(), 2);
     BOOST_CHECK_EQUAL(results[1], 2);
 
-    promise.resume(3);
+    event.set(3);
     BOOST_CHECK_EQUAL(results.size(), 3);
     BOOST_CHECK_EQUAL(results[2], 3);
 }
@@ -107,12 +107,14 @@ BOOST_AUTO_TEST_CASE(test_openat)
     unlink(TEST_FILE_PATH);
 
     Scheduler scheduler;
-    BOOST_REQUIRE_EQUAL(scheduler.init(16), YYASIO_OK);
 
     std::atomic<int> fd{-1};
     open_file_coro(&scheduler, fd).detach();
 
-    std::thread runner([&scheduler]() { scheduler.run(); });
+    std::thread runner([&scheduler]() {
+        BOOST_REQUIRE_EQUAL(scheduler.init(16), YYASIO_OK);
+        scheduler.run();
+    });
     runner.detach();
 
     auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
@@ -142,12 +144,14 @@ BOOST_AUTO_TEST_CASE(test_write)
     BOOST_REQUIRE(fd > 0);
 
     Scheduler scheduler;
-    BOOST_REQUIRE_EQUAL(scheduler.init(16), YYASIO_OK);
 
     std::atomic<int> bytes_written{0};
     write_file_coro(&scheduler, fd, bytes_written).detach();
 
-    std::thread runner([&scheduler]() { scheduler.run(); });
+    std::thread runner([&scheduler]() {
+        BOOST_REQUIRE_EQUAL(scheduler.init(16), YYASIO_OK);
+        scheduler.run();
+    });
     runner.detach();
 
     auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
@@ -177,13 +181,15 @@ BOOST_AUTO_TEST_CASE(test_read)
     ::lseek(fd, 0, SEEK_SET);  // Reset to beginning
 
     Scheduler scheduler;
-    BOOST_REQUIRE_EQUAL(scheduler.init(16), YYASIO_OK);
 
     char buffer[256] = {0};
     std::atomic<int> bytes_read{0};
     read_file_coro(&scheduler, fd, buffer, sizeof(buffer), bytes_read).detach();
 
-    std::thread runner([&scheduler]() { scheduler.run(); });
+    std::thread runner([&scheduler]() {
+        BOOST_REQUIRE_EQUAL(scheduler.init(16), YYASIO_OK);
+        scheduler.run();
+    });
     runner.detach();
 
     auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
@@ -212,12 +218,14 @@ BOOST_AUTO_TEST_CASE(test_close)
     BOOST_REQUIRE(fd > 0);
 
     Scheduler scheduler;
-    BOOST_REQUIRE_EQUAL(scheduler.init(16), YYASIO_OK);
 
     std::atomic<int> close_result{-1};
     close_file_coro(&scheduler, fd, close_result).detach();
 
-    std::thread runner([&scheduler]() { scheduler.run(); });
+    std::thread runner([&scheduler]() {
+        BOOST_REQUIRE_EQUAL(scheduler.init(16), YYASIO_OK);
+        scheduler.run();
+    });
     runner.detach();
 
     auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
@@ -263,12 +271,14 @@ BOOST_AUTO_TEST_CASE(test_file_io_combined)
     unlink(TEST_FILE_PATH);
 
     Scheduler scheduler;
-    BOOST_REQUIRE_EQUAL(scheduler.init(16), YYASIO_OK);
 
     std::atomic<bool> done{false};
     file_io_combined_coro(&scheduler, done).detach();
 
-    std::thread runner([&scheduler]() { scheduler.run(); });
+    std::thread runner([&scheduler]() {
+        BOOST_REQUIRE_EQUAL(scheduler.init(16), YYASIO_OK);
+        scheduler.run();
+    });
     runner.detach();
 
     auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
@@ -304,7 +314,6 @@ Task<void> get_return_value(Scheduler* scheduler, std::atomic<int>& result)
 BOOST_AUTO_TEST_CASE(test_coroutine_return_value)
 {
     Scheduler scheduler;
-    BOOST_REQUIRE_EQUAL(scheduler.init(16), YYASIO_OK);
 
     std::atomic<int> result{0};
 
@@ -312,7 +321,9 @@ BOOST_AUTO_TEST_CASE(test_coroutine_return_value)
     get_return_value(&scheduler, result).detach();
 
     // Run scheduler in background thread (run() is blocking)
+    // init() and run() must be on the same thread (IORING_SETUP_SINGLE_ISSUER)
     std::thread runner([&scheduler]() {
+        BOOST_REQUIRE_EQUAL(scheduler.init(16), YYASIO_OK);
         scheduler.run();
     });
     runner.detach();
@@ -345,7 +356,6 @@ Task<void> timeout_coro(Scheduler* scheduler, long nsec, std::atomic<int>& resul
 BOOST_AUTO_TEST_CASE(test_timeout)
 {
     Scheduler scheduler;
-    BOOST_REQUIRE_EQUAL(scheduler.init(16), YYASIO_OK);
 
     std::atomic<int> result{-1};
     std::atomic<long> elapsed_ns{0};
@@ -353,7 +363,10 @@ BOOST_AUTO_TEST_CASE(test_timeout)
 
     timeout_coro(&scheduler, timeout_ns, result, elapsed_ns).detach();
 
-    std::thread runner([&scheduler]() { scheduler.run(); });
+    std::thread runner([&scheduler]() {
+        BOOST_REQUIRE_EQUAL(scheduler.init(16), YYASIO_OK);
+        scheduler.run();
+    });
     runner.detach();
 
     auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
@@ -375,7 +388,7 @@ Task<uint64_t> get_sub_coro_id_test(Scheduler* scheduler)
     co_return id;
 }
 
-Task<void> coro_id_test_oro(Scheduler* scheduler, std::atomic<bool>& done,
+Task<void> coro_id_test_oro(std::atomic<bool>& done,
     std::array<uint64_t, 2>& parent_ids,
     std::array<uint64_t, 2>& sub_ids)
 {
@@ -384,30 +397,21 @@ Task<void> coro_id_test_oro(Scheduler* scheduler, std::atomic<bool>& done,
     parent_ids[1] = co_await current_coro_id();
 
     // Each sub-coroutine should have a different coro_id
-    sub_ids[0] = co_await get_sub_coro_id_test(scheduler);
-    sub_ids[1] = co_await get_sub_coro_id_test(scheduler);
+    sub_ids[0] = co_await get_sub_coro_id_test(nullptr);
+    sub_ids[1] = co_await get_sub_coro_id_test(nullptr);
 
     done.store(true);
 }
 
 BOOST_AUTO_TEST_CASE(test_coro_id)
 {
-    Scheduler scheduler;
-    BOOST_REQUIRE_EQUAL(scheduler.init(16), YYASIO_OK);
-
+    // current_coro_id() does not use io_uring, so no scheduler is needed.
+    // The coroutine runs synchronously via detach() (all await_suspend return false).
     std::atomic<bool> done{false};
     std::array<uint64_t, 2> parent_ids{0, 0};
     std::array<uint64_t, 2> sub_ids{0, 0};
 
-    coro_id_test_oro(&scheduler, done, parent_ids, sub_ids).detach();
-
-    std::thread runner([&scheduler]() { scheduler.run(); });
-    runner.detach();
-
-    auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
-    while (!done.load() && std::chrono::steady_clock::now() < deadline) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(10));
-    }
+    coro_id_test_oro(done, parent_ids, sub_ids).detach();
 
     BOOST_CHECK(done.load());
     // Parent's coro_id should be consistent across multiple calls
@@ -492,7 +496,6 @@ BOOST_AUTO_TEST_CASE(test_connect)
     BOOST_REQUIRE_EQUAL(listen(listen_fd, SOMAXCONN), 0);
 
     Scheduler scheduler;
-    BOOST_REQUIRE_EQUAL(scheduler.init(16), YYASIO_OK);
 
     std::atomic<bool> accepted{false};
     std::atomic<int> bytes_read{0};
@@ -507,7 +510,10 @@ BOOST_AUTO_TEST_CASE(test_connect)
     // Start client coroutine
     connect_and_send_test(&scheduler, 18080, connect_result, write_result).detach();
 
-    std::thread runner([&scheduler]() { scheduler.run(); });
+    std::thread runner([&scheduler]() {
+        BOOST_REQUIRE_EQUAL(scheduler.init(16), YYASIO_OK);
+        scheduler.run();
+    });
     runner.detach();
 
     // Wait for both to complete (including read operation)
@@ -553,12 +559,14 @@ BOOST_AUTO_TEST_CASE(test_listen)
     BOOST_REQUIRE_EQUAL(bind(listen_fd, (sockaddr*)&server_addr, sizeof(server_addr)), 0);
 
     Scheduler scheduler;
-    BOOST_REQUIRE_EQUAL(scheduler.init(16), YYASIO_OK);
 
     std::atomic<int> listen_result{-1};
     listen_coro(&scheduler, listen_fd, listen_result).detach();
 
-    std::thread runner([&scheduler]() { scheduler.run(); });
+    std::thread runner([&scheduler]() {
+        BOOST_REQUIRE_EQUAL(scheduler.init(16), YYASIO_OK);
+        scheduler.run();
+    });
     runner.detach();
 
     auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
