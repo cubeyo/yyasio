@@ -76,6 +76,39 @@ yyasio::Task<void> timeout_trigger(yyasio::Scheduler* scheduler)
     }
 }
 
+yyasio::Task<void> rename_file_demo(yyasio::Scheduler* scheduler)
+{
+    std::cout << "=== Rename File Demo ===\n";
+    
+    // Create a test file
+    const char* old_path = "/tmp/yyasio_rename_old.txt";
+    const char* new_path = "/tmp/yyasio_rename_new.txt";
+    
+    int fd = co_await yyasio::openat(scheduler, AT_FDCWD, old_path, O_RDWR | O_CREAT | O_TRUNC, 0644);
+    if (fd < 0)
+    {
+        std::cerr << "Failed to create file: " << old_path << "\n";
+        co_return;
+    }
+    
+    const char* content = "test content for rename";
+    co_await yyasio::write(scheduler, fd, content, strlen(content));
+    co_await yyasio::close(scheduler, fd);
+    std::cout << "Created file: " << old_path << "\n";
+    
+    // Rename the file
+    int ret = co_await yyasio::renameat(scheduler, AT_FDCWD, old_path, AT_FDCWD, new_path);
+    if (ret < 0)
+    {
+        std::cerr << "Rename failed, ret = " << ret << "\n";
+        co_return;
+    }
+    std::cout << "Renamed " << old_path << " -> " << new_path << "\n";
+    
+    // Clean up
+    unlink(new_path);
+}
+
 yyasio::Task<void> visit_regular_file(yyasio::Scheduler* scheduler)
 {
     int dir_fd = co_await yyasio::openat(scheduler, AT_FDCWD, "/tmp", O_RDONLY | O_DIRECTORY);
@@ -239,6 +272,8 @@ int main()
     tick_trigger(&scheduler, event).detach();
 
     connect_and_send(&scheduler).detach();
+
+    rename_file_demo(&scheduler).detach();
 
     // will block here
     scheduler.run();

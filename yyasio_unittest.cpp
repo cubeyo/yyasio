@@ -597,4 +597,63 @@ BOOST_AUTO_TEST_CASE(test_listen)
     ::close(listen_fd);
 }
 
+// ==================== Renameat Test ====================
+
+static const char* TEST_OLD_FILE_PATH = "/tmp/yyasio_test_old.txt";
+static const char* TEST_NEW_FILE_PATH = "/tmp/yyasio_test_new.txt";
+
+// Helper coroutine: async renameat and verify
+Task<void> renameat_coro(Scheduler* scheduler, int olddirfd, const char* oldpath, int newdirfd, const char* newpath, std::atomic<int>& result)
+{
+    int ret = co_await renameat(scheduler, olddirfd, oldpath, newdirfd, newpath);
+    std::cout << "renameat_coro: ret = " << ret << "\n";
+    result.store(ret);
+}
+
+BOOST_AUTO_TEST_CASE(test_renameat)
+{
+    // Create the old file first
+    int fd = ::open(TEST_OLD_FILE_PATH, O_RDWR | O_CREAT | O_TRUNC, 0644);
+    BOOST_REQUIRE(fd > 0);
+    ::write(fd, TEST_CONTENT, strlen(TEST_CONTENT));
+    ::close(fd);
+
+    // Clean up new file if exists
+    unlink(TEST_NEW_FILE_PATH);
+
+    Scheduler scheduler;
+
+    std::atomic<int> rename_result{-1};
+    renameat_coro(&scheduler, AT_FDCWD, TEST_OLD_FILE_PATH, AT_FDCWD, TEST_NEW_FILE_PATH, rename_result).detach();
+
+    std::thread runner([&scheduler]() {
+        BOOST_REQUIRE_EQUAL(scheduler.init(16), YYASIO_OK);
+        scheduler.run();
+    });
+    runner.detach();
+
+    auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (rename_result.load() == -1 && std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+
+    // renameat() returns 0 on success
+    BOOST_CHECK_EQUAL(rename_result.load(), 0);
+
+    // Verify old file no longer exists
+    BOOST_CHECK(access(TEST_OLD_FILE_PATH, F_OK) != 0);
+
+    // Verify new file exists and has correct content
+    fd = ::open(TEST_NEW_FILE_PATH, O_RDONLY);
+    BOOST_REQUIRE(fd > 0);
+    char buffer[256] = {0};
+    int bytes_read = ::read(fd, buffer, sizeof(buffer));
+    BOOST_CHECK_EQUAL(bytes_read, (int)strlen(TEST_CONTENT));
+    BOOST_CHECK_EQUAL(std::string(buffer), std::string(TEST_CONTENT));
+    ::close(fd);
+
+    // Clean up
+    unlink(TEST_NEW_FILE_PATH);
+}
+
 BOOST_AUTO_TEST_SUITE_END()

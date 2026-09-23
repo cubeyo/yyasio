@@ -623,7 +623,7 @@ inline UringAwaiter write(Scheduler* scheduler, int fd, const void* buffer, size
 }
 
 // for kernel <= 5.9, time_spec should be valid until the operation completes
-inline UringAwaiter timeout(Scheduler* scheduler, struct __kernel_timespec* time_spec, unsigned int count = 1, unsigned int flags = 0)
+inline UringAwaiter timeout(Scheduler* scheduler, struct __kernel_timespec* time_spec, unsigned int count = 0, unsigned int flags = 0)
 {
     PrepSqeClosure prepare_sqe_cb = [time_spec, count, flags](io_uring_sqe* sqe) -> void {
         io_uring_prep_timeout(sqe, time_spec, count, flags);
@@ -673,6 +673,14 @@ inline UringAwaiter listen(Scheduler* scheduler, int fd, int backlog = SOMAXCONN
 {
     PrepSqeClosure prepare_sqe_cb = [fd, backlog](io_uring_sqe* sqe) -> void {
         io_uring_prep_listen(sqe, fd, backlog);
+    };
+    return UringAwaiter{ scheduler, prepare_sqe_cb };
+}
+
+inline UringAwaiter renameat(Scheduler* scheduler, int olddirfd, const char* oldpath, int newdirfd, const char* newpath, unsigned int flags = 0)
+{
+    PrepSqeClosure prepare_sqe_cb = [olddirfd, oldpath, newdirfd, newpath, flags](io_uring_sqe* sqe) -> void {
+        io_uring_prep_renameat(sqe, olddirfd, oldpath, newdirfd, newpath, flags);
     };
     return UringAwaiter{ scheduler, prepare_sqe_cb };
 }
