@@ -452,17 +452,38 @@ public:
         pending_queue.push(std::make_tuple(coro, prep_seq_fn, presult, enter_ts));
     }
 
-    ErrorCode run()
+    void stop() { stopped = true; }
+
+    void run()
     {
-        while (true)
+        constexpr uint64_t MAGIC_IDLE_TIMEOUT = 0xFFFFFFFFFFFFFF00ULL;
+        constexpr struct __kernel_timespec idle_ts {0, 1000};
+        while (!stopped)
         {
             batch_prepare_sqe();
 
+            /* In single thread program, when reached here,
+             * there is at least one coroutine waiting IO
+             * inflight should not be empty.
+             * We add this to allow test program to stop
+             * scheduler gentally.
+             */
+            if (inflight_map.empty()) [[unlikely]]
+            {
+                auto* sqe = io_uring_get_sqe(&ring);
+                if (sqe)
+                {
+                    memset(sqe, 0, sizeof(*sqe));
+                    io_uring_prep_timeout(sqe, &idle_ts, 0, 0);
+                    io_uring_sqe_set_data64(sqe, MAGIC_IDLE_TIMEOUT);
+                }
+            }
+
             int submitted = io_uring_submit_and_wait(&ring, 1);
-            if (submitted < 0)
+            if (submitted < 0) [[unlikely]]
             {
                 std::cerr << "io_uring_submit_and_wait failed:, ret = " << submitted << "\n";
-                return YYASIO_SUBMIT_ERROR;
+                return;
             }
 
             tot_submit_items += submitted;
@@ -472,11 +493,16 @@ public:
             while (io_uring_peek_cqe(&ring, &cqe) == 0)
             {
                 auto inflight_idx = io_uring_cqe_get_data64(cqe);
+                if (inflight_idx == MAGIC_IDLE_TIMEOUT) [[unlikely]]
+                {
+                    io_uring_cqe_seen(&ring, cqe);
+                    continue;
+                }
                 int cqe_res = cqe->res;
                 io_uring_cqe_seen(&ring, cqe);
 
                 auto iter = inflight_map.find(inflight_idx);
-                if (iter == inflight_map.end())
+                if (iter == inflight_map.end()) [[unlikely]]
                 {
                     std::cerr << "duplicate cqe for index = " << inflight_idx << "\n";
                     // Duplicate CQE: the SQE already completed and the coroutine may
@@ -489,7 +515,7 @@ public:
                 auto handle = std::coroutine_handle<>::from_address(reinterpret_cast<void*>(coro_addr));
                 inflight_map.erase(iter);
                 debug_coro("io returned:", handle);
-                if (res_addr)
+                if (res_addr) [[likely]]
                 {
                     *res_addr = cqe_res;
                 }
@@ -553,6 +579,7 @@ private:
     uint64_t io_cnt = 0;
     std::unordered_map<uint64_t, std::tuple<void*, int*>> inflight_map; // io_idx -> <coro addr, result addr>
 
+    bool stopped = false;
     uint64_t tot_sched_time = 0;
     uint64_t tot_sched_count = 0;
     uint64_t tot_submit_items = 0;

@@ -115,7 +115,6 @@ BOOST_AUTO_TEST_CASE(test_openat)
         BOOST_REQUIRE_EQUAL(scheduler.init(16), YYASIO_OK);
         scheduler.run();
     });
-    runner.detach();
 
     auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
     while (fd.load() == -1 && std::chrono::steady_clock::now() < deadline) {
@@ -127,6 +126,8 @@ BOOST_AUTO_TEST_CASE(test_openat)
         ::close(fd.load());
     }
     unlink(TEST_FILE_PATH);
+    scheduler.stop();
+    runner.join();
 }
 
 // Test write: write content to a file
@@ -152,7 +153,6 @@ BOOST_AUTO_TEST_CASE(test_write)
         BOOST_REQUIRE_EQUAL(scheduler.init(16), YYASIO_OK);
         scheduler.run();
     });
-    runner.detach();
 
     auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
     while (bytes_written.load() == 0 && std::chrono::steady_clock::now() < deadline) {
@@ -162,6 +162,8 @@ BOOST_AUTO_TEST_CASE(test_write)
     BOOST_CHECK_EQUAL(bytes_written.load(), (int)strlen(TEST_CONTENT));
     ::close(fd);
     unlink(TEST_FILE_PATH);
+    scheduler.stop();
+    runner.join();
 }
 
 // Test read: read content from a file
@@ -190,7 +192,6 @@ BOOST_AUTO_TEST_CASE(test_read)
         BOOST_REQUIRE_EQUAL(scheduler.init(16), YYASIO_OK);
         scheduler.run();
     });
-    runner.detach();
 
     auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
     while (bytes_read.load() == 0 && std::chrono::steady_clock::now() < deadline) {
@@ -201,6 +202,8 @@ BOOST_AUTO_TEST_CASE(test_read)
     BOOST_CHECK_EQUAL(std::string(buffer), std::string(TEST_CONTENT));
     ::close(fd);
     unlink(TEST_FILE_PATH);
+    scheduler.stop();
+    runner.join();
 }
 
 // Test close: close a file descriptor
@@ -226,7 +229,6 @@ BOOST_AUTO_TEST_CASE(test_close)
         BOOST_REQUIRE_EQUAL(scheduler.init(16), YYASIO_OK);
         scheduler.run();
     });
-    runner.detach();
 
     auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
     while (close_result.load() == -1 && std::chrono::steady_clock::now() < deadline) {
@@ -236,6 +238,8 @@ BOOST_AUTO_TEST_CASE(test_close)
     // close() returns 0 on success
     BOOST_CHECK_EQUAL(close_result.load(), 0);
     unlink(TEST_FILE_PATH);
+    scheduler.stop();
+    runner.join();
 }
 
 // Combined test: open, write, read, close in sequence
@@ -279,7 +283,6 @@ BOOST_AUTO_TEST_CASE(test_file_io_combined)
         BOOST_REQUIRE_EQUAL(scheduler.init(16), YYASIO_OK);
         scheduler.run();
     });
-    runner.detach();
 
     auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
     while (!done.load() && std::chrono::steady_clock::now() < deadline) {
@@ -288,6 +291,8 @@ BOOST_AUTO_TEST_CASE(test_file_io_combined)
 
     BOOST_CHECK(done.load());
     unlink(TEST_FILE_PATH);
+    scheduler.stop();
+    runner.join();
 }
 
 // Magic number returned by the child coroutine
@@ -326,7 +331,6 @@ BOOST_AUTO_TEST_CASE(test_coroutine_return_value)
         BOOST_REQUIRE_EQUAL(scheduler.init(16), YYASIO_OK);
         scheduler.run();
     });
-    runner.detach();
 
     // Wait for result with timeout
     auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
@@ -335,9 +339,8 @@ BOOST_AUTO_TEST_CASE(test_coroutine_return_value)
     }
 
     BOOST_CHECK_EQUAL(result.load(), MAGIC_NUMBER);
-
-    // Note: scheduler.run() will keep running, but the test process will exit
-    // For a real test framework, we'd need a way to stop the scheduler
+    scheduler.stop();
+    runner.join();
 }
 
 // ==================== Timeout Test ====================
@@ -367,7 +370,6 @@ BOOST_AUTO_TEST_CASE(test_timeout)
         BOOST_REQUIRE_EQUAL(scheduler.init(16), YYASIO_OK);
         scheduler.run();
     });
-    runner.detach();
 
     auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
     while (result.load() == -1 && std::chrono::steady_clock::now() < deadline) {
@@ -378,6 +380,8 @@ BOOST_AUTO_TEST_CASE(test_timeout)
     BOOST_CHECK_EQUAL(result.load(), -ETIME);
     // Elapsed time should be at least 80% of the requested timeout
     BOOST_CHECK_GE(elapsed_ns.load(), timeout_ns * 8 / 10);
+    scheduler.stop();
+    runner.join();
 }
 
 // ==================== CoroId Test ====================
@@ -514,7 +518,6 @@ BOOST_AUTO_TEST_CASE(test_connect)
         BOOST_REQUIRE_EQUAL(scheduler.init(16), YYASIO_OK);
         scheduler.run();
     });
-    runner.detach();
 
     // Wait for both to complete (including read operation)
     auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
@@ -530,6 +533,8 @@ BOOST_AUTO_TEST_CASE(test_connect)
     BOOST_CHECK_EQUAL(std::string(read_buf, bytes_read.load()), "hello connect test");
 
     ::close(listen_fd);
+    scheduler.stop();
+    runner.join();
 }
 
 // ==================== Listen Test ====================
@@ -567,7 +572,6 @@ BOOST_AUTO_TEST_CASE(test_listen)
         BOOST_REQUIRE_EQUAL(scheduler.init(16), YYASIO_OK);
         scheduler.run();
     });
-    runner.detach();
 
     auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
     while (listen_result.load() == -1 && std::chrono::steady_clock::now() < deadline) {
@@ -595,6 +599,8 @@ BOOST_AUTO_TEST_CASE(test_listen)
         ::close(client_fd);
     }
     ::close(listen_fd);
+    scheduler.stop();
+    runner.join();
 }
 
 // ==================== Renameat Test ====================
@@ -630,7 +636,6 @@ BOOST_AUTO_TEST_CASE(test_renameat)
         BOOST_REQUIRE_EQUAL(scheduler.init(16), YYASIO_OK);
         scheduler.run();
     });
-    runner.detach();
 
     auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
     while (rename_result.load() == -1 && std::chrono::steady_clock::now() < deadline) {
@@ -654,6 +659,8 @@ BOOST_AUTO_TEST_CASE(test_renameat)
 
     // Clean up
     unlink(TEST_NEW_FILE_PATH);
+    scheduler.stop();
+    runner.join();
 }
 
 // ==================== Unlinkat Test ====================
@@ -688,7 +695,6 @@ BOOST_AUTO_TEST_CASE(test_unlinkat)
         BOOST_REQUIRE_EQUAL(scheduler.init(16), YYASIO_OK);
         scheduler.run();
     });
-    runner.detach();
 
     auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
     while (unlink_result.load() == -1 && std::chrono::steady_clock::now() < deadline) {
@@ -700,6 +706,8 @@ BOOST_AUTO_TEST_CASE(test_unlinkat)
 
     // Verify file no longer exists
     BOOST_CHECK(access(TEST_UNLINK_FILE_PATH, F_OK) != 0);
+    scheduler.stop();
+    runner.join();
 }
 
 // Test unlinkat on non-existent file: should return negative errno
@@ -721,7 +729,6 @@ BOOST_AUTO_TEST_CASE(test_unlinkat_nonexistent)
         BOOST_REQUIRE_EQUAL(scheduler.init(16), YYASIO_OK);
         scheduler.run();
     });
-    runner.detach();
 
     auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
     while (unlink_result.load() == 0 && std::chrono::steady_clock::now() < deadline) {
@@ -731,6 +738,8 @@ BOOST_AUTO_TEST_CASE(test_unlinkat_nonexistent)
     // unlinkat on non-existent file should return -ENOENT
     BOOST_CHECK_LT(unlink_result.load(), 0);
     BOOST_CHECK_EQUAL(unlink_result.load(), -ENOENT);
+    scheduler.stop();
+    runner.join();
 }
 
 BOOST_AUTO_TEST_SUITE_END()
