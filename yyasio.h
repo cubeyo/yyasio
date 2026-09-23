@@ -685,5 +685,13 @@ inline UringAwaiter renameat(Scheduler* scheduler, int olddirfd, const char* old
     return UringAwaiter{ scheduler, prepare_sqe_cb };
 }
 
+inline UringAwaiter unlinkat(Scheduler* scheduler, int dirfd, const char* pathname, int flags = 0)
+{
+    PrepSqeClosure prepare_sqe_cb = [dirfd, pathname, flags](io_uring_sqe* sqe) -> void {
+        io_uring_prep_unlinkat(sqe, dirfd, pathname, flags);
+    };
+    return UringAwaiter{ scheduler, prepare_sqe_cb };
+}
+
 } // namespace yyasio
 

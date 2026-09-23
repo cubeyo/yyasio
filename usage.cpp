@@ -6,6 +6,7 @@
 #include <netinet/in.h>
 #include <sys/socket.h>
 #include <arpa/inet.h>
+#include <sys/stat.h>
 #include "yyasio.h"
 
 yyasio::Task<void> handle_client(yyasio::Scheduler* scheduler, int conn_fd)
@@ -107,6 +108,48 @@ yyasio::Task<void> rename_file_demo(yyasio::Scheduler* scheduler)
     
     // Clean up
     unlink(new_path);
+}
+
+yyasio::Task<void> unlink_file_demo(yyasio::Scheduler* scheduler)
+{
+    std::cout << "=== Unlink File Demo ===\n";
+    
+    const char* file_path = "/tmp/yyasio_unlink_test.txt";
+    
+    // Create a test file
+    int fd = co_await yyasio::openat(scheduler, AT_FDCWD, file_path, O_RDWR | O_CREAT | O_TRUNC, 0644);
+    if (fd < 0)
+    {
+        std::cerr << "Failed to create file: " << file_path << "\n";
+        co_return;
+    }
+    
+    const char* content = "test content for unlink";
+    co_await yyasio::write(scheduler, fd, content, strlen(content));
+    co_await yyasio::close(scheduler, fd);
+    std::cout << "Created file: " << file_path << "\n";
+    
+    // Verify file exists
+    struct stat st;
+    if (stat(file_path, &st) == 0)
+    {
+        std::cout << "File exists, size = " << st.st_size << " bytes\n";
+    }
+    
+    // Unlink the file via io_uring
+    int ret = co_await yyasio::unlinkat(scheduler, AT_FDCWD, file_path, 0);
+    if (ret < 0)
+    {
+        std::cerr << "Unlink failed, ret = " << ret << "\n";
+        co_return;
+    }
+    std::cout << "Unlinked file: " << file_path << "\n";
+    
+    // Verify file no longer exists
+    if (stat(file_path, &st) != 0)
+    {
+        std::cout << "Confirmed: file no longer exists\n";
+    }
 }
 
 yyasio::Task<void> visit_regular_file(yyasio::Scheduler* scheduler)
@@ -274,6 +317,8 @@ int main()
     connect_and_send(&scheduler).detach();
 
     rename_file_demo(&scheduler).detach();
+
+    unlink_file_demo(&scheduler).detach();
 
     // will block here
     scheduler.run();

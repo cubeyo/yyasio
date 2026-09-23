@@ -656,4 +656,81 @@ BOOST_AUTO_TEST_CASE(test_renameat)
     unlink(TEST_NEW_FILE_PATH);
 }
 
+// ==================== Unlinkat Test ====================
+
+static const char* TEST_UNLINK_FILE_PATH = "/tmp/yyasio_test_unlink.txt";
+
+// Helper coroutine: async unlinkat and verify
+Task<void> unlinkat_coro(Scheduler* scheduler, int dirfd, const char* pathname, int flags, std::atomic<int>& result)
+{
+    int ret = co_await unlinkat(scheduler, dirfd, pathname, flags);
+    std::cout << "unlinkat_coro: ret = " << ret << "\n";
+    result.store(ret);
+}
+
+BOOST_AUTO_TEST_CASE(test_unlinkat)
+{
+    // Create the file first
+    int fd = ::open(TEST_UNLINK_FILE_PATH, O_RDWR | O_CREAT | O_TRUNC, 0644);
+    BOOST_REQUIRE(fd > 0);
+    ::write(fd, TEST_CONTENT, strlen(TEST_CONTENT));
+    ::close(fd);
+
+    // Verify file exists
+    BOOST_CHECK_EQUAL(access(TEST_UNLINK_FILE_PATH, F_OK), 0);
+
+    Scheduler scheduler;
+
+    std::atomic<int> unlink_result{-1};
+    unlinkat_coro(&scheduler, AT_FDCWD, TEST_UNLINK_FILE_PATH, 0, unlink_result).detach();
+
+    std::thread runner([&scheduler]() {
+        BOOST_REQUIRE_EQUAL(scheduler.init(16), YYASIO_OK);
+        scheduler.run();
+    });
+    runner.detach();
+
+    auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (unlink_result.load() == -1 && std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+
+    // unlinkat() returns 0 on success
+    BOOST_CHECK_EQUAL(unlink_result.load(), 0);
+
+    // Verify file no longer exists
+    BOOST_CHECK(access(TEST_UNLINK_FILE_PATH, F_OK) != 0);
+}
+
+// Test unlinkat on non-existent file: should return negative errno
+Task<void> unlinkat_nonexist_coro(Scheduler* scheduler, std::atomic<int>& result)
+{
+    int ret = co_await unlinkat(scheduler, AT_FDCWD, "/tmp/yyasio_nonexistent_file_xyz.txt", 0);
+    std::cout << "unlinkat_nonexist_coro: ret = " << ret << "\n";
+    result.store(ret);
+}
+
+BOOST_AUTO_TEST_CASE(test_unlinkat_nonexistent)
+{
+    Scheduler scheduler;
+
+    std::atomic<int> unlink_result{0};
+    unlinkat_nonexist_coro(&scheduler, unlink_result).detach();
+
+    std::thread runner([&scheduler]() {
+        BOOST_REQUIRE_EQUAL(scheduler.init(16), YYASIO_OK);
+        scheduler.run();
+    });
+    runner.detach();
+
+    auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (unlink_result.load() == 0 && std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+
+    // unlinkat on non-existent file should return -ENOENT
+    BOOST_CHECK_LT(unlink_result.load(), 0);
+    BOOST_CHECK_EQUAL(unlink_result.load(), -ENOENT);
+}
+
 BOOST_AUTO_TEST_SUITE_END()
