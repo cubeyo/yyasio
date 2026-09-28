@@ -7,6 +7,7 @@
 #include <coroutine>
 #include <functional>
 #include <queue>
+#include <memory>
 #include <sys/socket.h>
 #include <unordered_map>
 #include <liburing.h>
@@ -360,7 +361,7 @@ struct Task
             detail::CoroDebugInfo debug_info;
             get_debuginfo(&debug_info);
             detail::DebugInfoStore::store_debuginfo(coro.address(), std::move(debug_info));
-            return Task(coro);
+            return Task(coro, _done_guard);
         }
 
         void unhandled_exception() noexcept {
@@ -371,15 +372,25 @@ struct Task
             std::terminate();
         }
         
-        std::coroutine_handle<> _caller;
+        ~promise_type()
+        {
+            *_done_guard = true;
+        }
+
+        std::shared_ptr<std::atomic<bool>> _done_guard = std::make_shared<std::atomic<bool>>(false);
+        std::coroutine_handle<> _caller { nullptr };
     };
 
     std::coroutine_handle<promise_type> _callee = nullptr;
-    Task(std::coroutine_handle<promise_type> handle) : _callee(handle)
+    std::shared_ptr<std::atomic<bool>> _done_guard = nullptr;
+
+    Task(std::coroutine_handle<promise_type> handle, std::shared_ptr<std::atomic<bool>> done_guard) : _callee(handle), _done_guard(done_guard)
     {
         debug_coro("create coro for non-void task:", _callee);
     }
-    Task(Task&& other) noexcept : _callee(other._callee) { other._callee = nullptr; }
+    Task(Task&& other) noexcept : _callee(other._callee), _done_guard(std::move(other._done_guard))
+    { other._callee = nullptr; }
+
     Task& operator=(Task&&) = delete;
 
     // Frame is self-destroyed in FinalAwaiter::await_suspend.
@@ -390,6 +401,16 @@ struct Task
     {
         _callee.resume();
         _callee = nullptr;
+    }
+
+    // Returns true only after the coroutine frame has been destroyed
+    // (~promise_type sets the shared done_guard to true). Combined with detach(),
+    // this is the way to observe completion of a fire-and-forget coroutine.
+    // Note: for `co_await task` / temporaries, the Task object usually dies
+    // together with the frame, so there is no window to observe it.
+    bool is_finished() const
+    {
+        return _done_guard && _done_guard->load();
     }
 
     // to support co_await on Task

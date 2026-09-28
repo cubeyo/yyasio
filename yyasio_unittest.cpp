@@ -427,6 +427,94 @@ BOOST_AUTO_TEST_CASE(test_coro_id)
     BOOST_CHECK_NE(parent_ids[1], sub_ids[1]);
 }
 
+// ==================== IsFinished Test ====================
+
+// Helper coroutines for is_finished tests
+Task<void> wait_event_then_done(Event<int>& event, std::atomic<bool>& done)
+{
+    co_await event.wait();
+    done.store(true);
+}
+
+Task<int> sync_return_value() { co_return 42; }
+
+// Await a child Task and report its is_finished() from within the parent coroutine
+Task<void> check_child_is_finished(std::atomic<bool>& child_finished_in_parent, std::atomic<bool>& parent_done)
+{
+    auto child = sync_return_value();
+    BOOST_CHECK(!child.is_finished()); // not started yet
+    int val = co_await child;
+    BOOST_CHECK_EQUAL(val, 42);
+    // Child frame was destroyed in await_resume, but our Task object is still alive
+    child_finished_in_parent.store(child.is_finished());
+    parent_done.store(true);
+}
+
+BOOST_AUTO_TEST_CASE(test_is_finished_sync_detach)
+{
+    // Coroutine runs to completion synchronously inside detach(),
+    // frame (and ~promise_type) already executed before detach() returns.
+    auto task = sync_return_value();
+    BOOST_CHECK(!task.is_finished());
+
+    task.detach();
+
+    BOOST_CHECK(task.is_finished());
+}
+
+BOOST_AUTO_TEST_CASE(test_is_finished_async_detach)
+{
+    // is_finished() must stay false while the coroutine is suspended,
+    // and flip to true once it runs to completion.
+    Event<int> event;
+    std::atomic<bool> done{false};
+
+    auto task = wait_event_then_done(event, done);
+    BOOST_CHECK(!task.is_finished()); // created but not started
+
+    task.detach(); // resumes until co_await event.wait()
+    BOOST_CHECK(!task.is_finished()); // suspended, frame still alive
+    BOOST_CHECK(!done.load());
+
+    event.set(1); // resumes and finishes the coroutine synchronously
+    BOOST_CHECK(done.load());
+    BOOST_CHECK(task.is_finished());
+}
+
+BOOST_AUTO_TEST_CASE(test_is_finished_after_move)
+{
+    // The move transfers the done_guard to the new Task, so completion is only
+    // observable through the moved-to object; the moved-from one has no guard.
+    Event<int> event;
+    std::atomic<bool> done{false};
+
+    auto task = wait_event_then_done(event, done);
+    auto moved = std::move(task);
+
+    // moved-from has no guard -> always false
+    BOOST_CHECK(!task.is_finished());
+    BOOST_CHECK(!moved.is_finished());
+
+    moved.detach();
+    event.set(1);
+
+    BOOST_CHECK(moved.is_finished());
+    BOOST_CHECK(!task.is_finished()); // guard was moved away
+}
+
+BOOST_AUTO_TEST_CASE(test_is_finished_with_co_await)
+{
+    // After `co_await child`, the child's frame is destroyed in await_resume,
+    // so a named Task object can observe is_finished() == true from the parent.
+    std::atomic<bool> child_finished_in_parent{false};
+    std::atomic<bool> parent_done{false};
+
+    check_child_is_finished(child_finished_in_parent, parent_done).detach();
+
+    BOOST_CHECK(parent_done.load());
+    BOOST_CHECK(child_finished_in_parent.load());
+}
+
 // ==================== Connect Test ====================
 
 // Server coroutine: accept one connection and read data

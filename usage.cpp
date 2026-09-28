@@ -61,6 +61,31 @@ yyasio::Task<int> coro_with_return_val(yyasio::Scheduler* scheduler)
     co_return 100;
 }
 
+// Demo of Task::is_finished(): observe the completion of a fire-and-forget coroutine.
+// The worker detaches itself, and the poller checks is_finished() between timeouts.
+yyasio::Task<void> background_worker(yyasio::Scheduler* scheduler)
+{
+    struct __kernel_timespec ts = { .tv_sec = 1, .tv_nsec = 0 };
+    co_await yyasio::timeout(scheduler, &ts); // simulate some async work
+    std::cout << "background_worker: work done\n";
+}
+
+yyasio::Task<void> is_finished_demo(yyasio::Scheduler* scheduler)
+{
+    auto worker = background_worker(scheduler);
+    std::cout << "worker is_finished = " << worker.is_finished() << " (just created)\n";
+
+    worker.detach(); // fire-and-forget, frame is owned by itself now
+
+    struct __kernel_timespec ts = { .tv_sec = 0, .tv_nsec = 200'000'000 }; // 200ms
+    while (!worker.is_finished())
+    {
+        std::cout << "worker is_finished = false, polling again after 200ms\n";
+        co_await yyasio::timeout(scheduler, &ts);
+    }
+    std::cout << "worker is_finished = true\n";
+}
+
 yyasio::Task<void> timeout_trigger(yyasio::Scheduler* scheduler)
 {
     std::cout << "start timeout trigger...\n";
@@ -319,6 +344,8 @@ int main()
     rename_file_demo(&scheduler).detach();
 
     unlink_file_demo(&scheduler).detach();
+
+    is_finished_demo(&scheduler).detach();
 
     // will block here
     scheduler.run();
