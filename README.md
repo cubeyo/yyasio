@@ -7,7 +7,7 @@
 ## 特性
 
 - **Header-only**：单个头文件 `yyasio.h`，拷贝即用。
-- **io_uring 封装**：`read` / `write` / `openat` / `close` / `accept` / `connect` / `listen` / `timeout` / `renameat` / `unlinkat` / `cancel_fd` 等常用操作的异步 awaiter。
+- **io_uring 封装**：`read` / `write` / `sync_file_range` / `openat` / `close` / `accept` / `connect` / `listen` / `timeout` / `renameat` / `unlinkat` / `cancel_fd` 等常用操作的异步 awaiter。
 - **C++20 协程支持**：`Task<T>` / `Task<void>`，支持 `co_await` 组合与 `detach()` 的 fire-and-forget 用法。
 - **单线程事件循环**：`Scheduler` 以单线程驱动 io_uring，模型简单、无锁竞争。
 - **协程调试能力**（编译期开关）：异常时打印硬件栈回溯与协程调用链、协程生命周期日志。
@@ -130,6 +130,7 @@ yyasio::Task<void> setter(yyasio::Event<int>& e) {
 | `openat(sched, dirfd, path, flags, mode)` | 打开文件 |
 | `read(sched, fd, buf, size, offset=0)` | 读 |
 | `write(sched, fd, buf, size, offset=0)` | 写 |
+| `sync_file_range(sched, fd, offset, len, flags)` | 同步文件区间到存储，`flags` 为 `SYNC_FILE_RANGE_WRITE` / `SYNC_FILE_RANGE_WAIT_BEFORE` / `SYNC_FILE_RANGE_WAIT_AFTER` 的组合（需 `<fcntl.h>`） |
 | `close(sched, fd)` | 关闭 fd |
 | `accept(sched, listen_fd, addr, len, flags)` | 接受连接 |
 | `connect(sched, fd, addr, len)` | 发起连接 |

@@ -177,6 +177,49 @@ yyasio::Task<void> unlink_file_demo(yyasio::Scheduler* scheduler)
     }
 }
 
+yyasio::Task<void> sync_file_range_demo(yyasio::Scheduler* scheduler)
+{
+    std::cout << "=== Sync File Range Demo ===\n";
+
+    const char* file_path = "/tmp/yyasio_sync_test.txt";
+
+    // Create a test file and write some data into the page cache
+    int fd = co_await yyasio::openat(scheduler, AT_FDCWD, file_path, O_RDWR | O_CREAT | O_TRUNC, 0644);
+    if (fd < 0)
+    {
+        std::cerr << "Failed to create file: " << file_path << "\n";
+        co_return;
+    }
+
+    const char* content = "test content for sync_file_range";
+    co_await yyasio::write(scheduler, fd, content, strlen(content));
+
+    // Start writeback of the dirty range without waiting for completion
+    int ret = co_await yyasio::sync_file_range(scheduler, fd, 0, strlen(content), SYNC_FILE_RANGE_WRITE);
+    if (ret < 0)
+    {
+        std::cerr << "sync_file_range failed, ret = " << ret << "\n";
+        co_await yyasio::close(scheduler, fd);
+        co_return;
+    }
+    std::cout << "sync_file_range(SYNC_FILE_RANGE_WRITE) ok\n";
+
+    // Flush and wait until the data is stable on storage
+    ret = co_await yyasio::sync_file_range(scheduler, fd, 0, strlen(content),
+                                           SYNC_FILE_RANGE_WAIT_BEFORE | SYNC_FILE_RANGE_WRITE | SYNC_FILE_RANGE_WAIT_AFTER);
+    if (ret < 0)
+    {
+        std::cerr << "sync_file_range(wait) failed, ret = " << ret << "\n";
+    }
+    else
+    {
+        std::cout << "sync_file_range(WAIT_BEFORE|WRITE|WAIT_AFTER) ok, data flushed\n";
+    }
+
+    co_await yyasio::close(scheduler, fd);
+    unlink(file_path);
+}
+
 yyasio::Task<void> visit_regular_file(yyasio::Scheduler* scheduler)
 {
     int dir_fd = co_await yyasio::openat(scheduler, AT_FDCWD, "/tmp", O_RDONLY | O_DIRECTORY);
@@ -344,6 +387,8 @@ int main()
     rename_file_demo(&scheduler).detach();
 
     unlink_file_demo(&scheduler).detach();
+
+    sync_file_range_demo(&scheduler).detach();
 
     is_finished_demo(&scheduler).detach();
 

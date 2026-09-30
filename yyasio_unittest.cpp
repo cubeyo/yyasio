@@ -830,4 +830,85 @@ BOOST_AUTO_TEST_CASE(test_unlinkat_nonexistent)
     runner.join();
 }
 
+// ==================== SyncFileRange Test ====================
+
+static const char* TEST_SYNC_FILE_PATH = "/tmp/yyasio_test_sync_range.txt";
+
+// Helper coroutine: async sync_file_range and verify
+Task<void> sync_file_range_coro(Scheduler* scheduler, int fd, uint64_t offset, unsigned len, int flags, std::atomic<int>& result)
+{
+    int ret = co_await sync_file_range(scheduler, fd, offset, len, flags);
+    std::cout << "sync_file_range_coro: ret = " << ret << "\n";
+    result.store(ret);
+}
+
+BOOST_AUTO_TEST_CASE(test_sync_file_range)
+{
+    // Create a file with dirty data in page cache
+    int fd = ::open(TEST_SYNC_FILE_PATH, O_RDWR | O_CREAT | O_TRUNC, 0644);
+    BOOST_REQUIRE(fd > 0);
+    ::write(fd, TEST_CONTENT, strlen(TEST_CONTENT));
+
+    Scheduler scheduler;
+
+    std::atomic<int> sync_result{-1};
+    // WAIT_BEFORE|WRITE|WAIT_AFTER: flush the range and wait for stable storage
+    sync_file_range_coro(&scheduler, fd, 0, strlen(TEST_CONTENT),
+                         SYNC_FILE_RANGE_WAIT_BEFORE | SYNC_FILE_RANGE_WRITE | SYNC_FILE_RANGE_WAIT_AFTER,
+                         sync_result).detach();
+
+    std::thread runner([&scheduler]() {
+        BOOST_REQUIRE_EQUAL(scheduler.init(16), YYASIO_OK);
+        scheduler.run();
+    });
+
+    auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (sync_result.load() == -1 && std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+
+    // sync_file_range() returns 0 on success
+    BOOST_CHECK_EQUAL(sync_result.load(), 0);
+
+    // Content should still be readable after sync
+    char buffer[256] = {0};
+    BOOST_CHECK_EQUAL(::pread(fd, buffer, sizeof(buffer), 0), (long)strlen(TEST_CONTENT));
+    BOOST_CHECK_EQUAL(std::string(buffer), std::string(TEST_CONTENT));
+
+    ::close(fd);
+    unlink(TEST_SYNC_FILE_PATH);
+    scheduler.stop();
+    runner.join();
+}
+
+// Test sync_file_range on an invalid fd: should return -EBADF
+Task<void> sync_file_range_badfd_coro(Scheduler* scheduler, std::atomic<int>& result)
+{
+    int ret = co_await sync_file_range(scheduler, -1, 0, 0, SYNC_FILE_RANGE_WRITE);
+    std::cout << "sync_file_range_badfd_coro: ret = " << ret << "\n";
+    result.store(ret);
+}
+
+BOOST_AUTO_TEST_CASE(test_sync_file_range_badfd)
+{
+    Scheduler scheduler;
+
+    std::atomic<int> sync_result{0};
+    sync_file_range_badfd_coro(&scheduler, sync_result).detach();
+
+    std::thread runner([&scheduler]() {
+        BOOST_REQUIRE_EQUAL(scheduler.init(16), YYASIO_OK);
+        scheduler.run();
+    });
+
+    auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (sync_result.load() == 0 && std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+
+    BOOST_CHECK_EQUAL(sync_result.load(), -EBADF);
+    scheduler.stop();
+    runner.join();
+}
+
 BOOST_AUTO_TEST_SUITE_END()

@@ -12,6 +12,7 @@
 #include <unordered_map>
 #include <liburing.h>
 #include <variant>
+#include <atomic>
 
 #ifndef PRINT_STACK_ON_EXCEPTION
 #define PRINT_STACK_ON_EXCEPTION 0
@@ -384,14 +385,30 @@ struct Task
     std::coroutine_handle<promise_type> _callee = nullptr;
     std::shared_ptr<std::atomic<bool>> _done_guard = nullptr;
 
+    Task() = default;
+
     Task(std::coroutine_handle<promise_type> handle, std::shared_ptr<std::atomic<bool>> done_guard) : _callee(handle), _done_guard(done_guard)
     {
         debug_coro("create coro for non-void task:", _callee);
     }
+
+    Task(const Task& other) = delete;
+    Task& operator=(const Task&) = delete;
+
     Task(Task&& other) noexcept : _callee(other._callee), _done_guard(std::move(other._done_guard))
     { other._callee = nullptr; }
 
-    Task& operator=(Task&&) = delete;
+    Task& operator=(Task&& other) noexcept
+    {
+        if (this == &other) [[unlikely]]
+        {
+            return *this;
+        }
+        _callee = other._callee;
+        _done_guard = std::move(other._done_guard);
+        other._callee = nullptr;
+        return *this;
+    }
 
     // Frame is self-destroyed in FinalAwaiter::await_suspend.
     // ~Task() is intentionally a no-op to support fire-and-forget usage.
@@ -473,13 +490,19 @@ public:
         pending_queue.push(std::make_tuple(coro, prep_seq_fn, presult, enter_ts));
     }
 
-    void stop() { stopped = true; }
+    // Request the loop to return. stop() may be called from another thread (that is
+    // how the unit tests shut a scheduler down), hence the atomic flag. Note that it
+    // only makes the request visible: run() re-checks it once per iteration, so the
+    // loop returns when the next completion arrives. Do not reach for the ring from
+    // here to force that wakeup -- it is set up SINGLE_ISSUER, only the thread that
+    // runs it may touch it.
+    void stop() { stopped.store(true, std::memory_order_release); }
 
     void run()
     {
         constexpr uint64_t MAGIC_IDLE_TIMEOUT = 0xFFFFFFFFFFFFFF00ULL;
         constexpr struct __kernel_timespec idle_ts {0, 1000};
-        while (!stopped)
+        while (!stopped.load(std::memory_order_acquire))
         {
             batch_prepare_sqe();
 
@@ -600,7 +623,7 @@ private:
     uint64_t io_cnt = 0;
     std::unordered_map<uint64_t, std::tuple<void*, int*>> inflight_map; // io_idx -> <coro addr, result addr>
 
-    bool stopped = false;
+    std::atomic<bool> stopped{false};
     uint64_t tot_sched_time = 0;
     uint64_t tot_sched_count = 0;
     uint64_t tot_submit_items = 0;
@@ -666,6 +689,14 @@ inline UringAwaiter write(Scheduler* scheduler, int fd, const void* buffer, size
 {
     PrepSqeClosure prepare_sqe_cb = [fd, buffer, buffer_size, offset](io_uring_sqe* sqe) -> void {
         io_uring_prep_write(sqe, fd, buffer, buffer_size, offset);
+    };
+    return UringAwaiter{ scheduler, prepare_sqe_cb };
+}
+
+inline UringAwaiter sync_file_range(Scheduler* scheduler, int fd, uint64_t offset, unsigned len, int flags)
+{
+    PrepSqeClosure prepare_sqe_cb = [fd, offset, len, flags](io_uring_sqe* sqe) -> void {
+        io_uring_prep_sync_file_range(sqe, fd, len, offset, flags);
     };
     return UringAwaiter{ scheduler, prepare_sqe_cb };
 }
@@ -742,4 +773,3 @@ inline UringAwaiter unlinkat(Scheduler* scheduler, int dirfd, const char* pathna
 }
 
 } // namespace yyasio
-
