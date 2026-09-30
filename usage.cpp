@@ -360,6 +360,73 @@ yyasio::Task<void> connect_and_send(yyasio::Scheduler* scheduler)
     close(fd);
 }
 
+// Two coroutines share one counter. The critical section spans a co_await
+// (a 200ms timeout), so without the mutex the read-modify-write would be
+// interleaved; with it, each increment runs atomically w.r.t. the other coro.
+yyasio::Task<void> mutex_writer(yyasio::Scheduler* scheduler, yyasio::Mutex& mtx, int* counter, int id,
+                                std::atomic<int>& finished)
+{
+    co_await mtx.lock();
+    std::cout << "writer " << id << ": entered critical section, counter = " << *counter << "\n";
+    struct __kernel_timespec ts = { .tv_sec = 0, .tv_nsec = 200'000'000 }; // hold across an await point
+    co_await yyasio::timeout(scheduler, &ts);
+    *counter = *counter + 1;
+    std::cout << "writer " << id << ": incremented to " << *counter << ", unlocking\n";
+    mtx.unlock();
+    finished.fetch_add(1);
+}
+
+yyasio::Task<void> mutex_demo(yyasio::Scheduler* scheduler)
+{
+    yyasio::Mutex mtx;
+    int counter = 0;
+    std::atomic<int> finished{0};
+    mutex_writer(scheduler, mtx, &counter, 1, finished).detach();
+    mutex_writer(scheduler, mtx, &counter, 2, finished).detach();
+    // writer 2 is suspended in mtx.lock() until writer 1 calls unlock()
+
+    // mtx and counter live in this coroutine's frame; wait until both writers
+    // are done before the frame is destroyed, so the waiters' references stay valid
+    struct __kernel_timespec ts = { .tv_sec = 0, .tv_nsec = 50'000'000 }; // 50ms
+    while (finished.load() < 2)
+    {
+        co_await yyasio::timeout(scheduler, &ts);
+    }
+    std::cout << "mutex_demo: final counter = " << counter << " (expected 2)\n";
+}
+
+// Same shared-counter pattern, but the critical section is delimited by an
+// RAII guard: co_await mtx.lock_guard() returns a LockGuard whose destructor
+// unlocks at scope exit, so there is no manual unlock() to forget.
+yyasio::Task<void> guarded_writer(yyasio::Scheduler* scheduler, yyasio::Mutex& mtx, int* counter, int id,
+                                  std::atomic<int>& finished)
+{
+    auto guard = co_await mtx.lock_guard();
+    std::cout << "guarded_writer " << id << ": locked via RAII, counter = " << *counter << "\n";
+    struct __kernel_timespec ts = { .tv_sec = 0, .tv_nsec = 150'000'000 }; // hold across an await point
+    co_await yyasio::timeout(scheduler, &ts);
+    *counter = *counter + 1;
+    std::cout << "guarded_writer " << id << ": incremented to " << *counter << ", leaving scope\n";
+    // guard destructs here -> unlock()
+    finished.fetch_add(1);
+}
+
+yyasio::Task<void> lock_guard_demo(yyasio::Scheduler* scheduler)
+{
+    yyasio::Mutex mtx;
+    int counter = 0;
+    std::atomic<int> finished{0};
+    guarded_writer(scheduler, mtx, &counter, 1, finished).detach();
+    guarded_writer(scheduler, mtx, &counter, 2, finished).detach();
+
+    struct __kernel_timespec ts = { .tv_sec = 0, .tv_nsec = 50'000'000 }; // 50ms
+    while (finished.load() < 2)
+    {
+        co_await yyasio::timeout(scheduler, &ts);
+    }
+    std::cout << "lock_guard_demo: final counter = " << counter << " (expected 2)\n";
+}
+
 int main()
 {
     yyasio::Scheduler scheduler;
@@ -389,6 +456,10 @@ int main()
     unlink_file_demo(&scheduler).detach();
 
     sync_file_range_demo(&scheduler).detach();
+
+    mutex_demo(&scheduler).detach();
+
+    lock_guard_demo(&scheduler).detach();
 
     is_finished_demo(&scheduler).detach();
 

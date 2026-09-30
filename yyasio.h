@@ -281,6 +281,99 @@ private:
     T _value;
 };
 
+struct Mutex
+{
+    struct Awaiter
+    {
+        Awaiter(Mutex* mtx): _mtx(mtx) {}
+        // Fast path: grab the lock here and now, co_await returns without suspending.
+        // Otherwise leave _locked == true and fall through to await_suspend.
+        bool await_ready() noexcept {
+            if (!_mtx->_locked)
+            {
+                _mtx->_locked = true;
+                return true;
+            }
+            return false;
+        }
+        bool await_suspend(std::coroutine_handle<> handle) noexcept {
+            _mtx->_waiters.push(handle);
+            return true;
+        }
+        void await_resume() const noexcept { }
+        Mutex* _mtx;
+    };
+    
+    struct LockGuard
+    {
+        LockGuard(Mutex& mtx): _mtx(mtx) {}
+        LockGuard(const LockGuard&) = delete;
+        LockGuard& operator=(const LockGuard&) = delete;
+        LockGuard(LockGuard&&) = delete;
+        LockGuard& operator=(LockGuard&&) = delete;
+        ~LockGuard() { _mtx.unlock(); }
+    private:
+        Mutex& _mtx;
+    };
+
+    struct AwaiterWithGuard
+    {
+        AwaiterWithGuard(Mutex* mtx): _mtx(mtx) {}
+        bool await_ready() noexcept
+        {
+            if (!_mtx->_locked)
+            {
+                _mtx->_locked = true;
+                return true;
+            }
+            return false;
+        }
+        bool await_suspend(std::coroutine_handle<> handle) noexcept {
+            _mtx->_waiters.push(handle);
+            return true;
+        }
+        LockGuard await_resume() const noexcept
+        {
+            return {*_mtx};
+        }
+        Mutex* _mtx;
+    };
+
+    AwaiterWithGuard lock_guard() { return AwaiterWithGuard(this); }
+    Awaiter lock() { return Awaiter(this); }
+
+    void unlock()
+    {
+        if (_waiters.empty())
+        {
+            _locked = false;
+            return;
+        }
+        // Keep _locked == true: ownership is transferred to the woken waiter,
+        // its await_resume() completes without touching the flag.
+        auto next = _waiters.front();
+        _waiters.pop();
+        next.resume();
+    }
+
+    bool try_lock() noexcept
+    {
+        if (_locked)
+        {
+            return false;
+        }
+        _locked = true;
+        return true;
+    }
+
+    // Number of coroutines currently suspended in lock()
+    size_t waiter_count() const { return _waiters.size(); }
+
+private:
+    bool _locked = false;
+    std::queue<std::coroutine_handle<>> _waiters;
+};
+
 namespace detail
 {
 struct CoroIdAwaiter {

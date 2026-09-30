@@ -911,4 +911,217 @@ BOOST_AUTO_TEST_CASE(test_sync_file_range_badfd)
     runner.join();
 }
 
+// ==================== Mutex Test ====================
+
+// Helper coroutine: lock, hold for hold_ns, record its tag, unlock
+Task<void> mutex_locked_incr(Scheduler* scheduler, Mutex& mtx, long hold_ns,
+                             int tag, std::vector<int>& order, std::atomic<int>& done)
+{
+    co_await mtx.lock();
+    if (hold_ns > 0)
+    {
+        struct __kernel_timespec ts = { .tv_sec = hold_ns / 1000000000L, .tv_nsec = hold_ns % 1000000000L };
+        co_await timeout(scheduler, &ts);
+    }
+    order.push_back(tag);
+    mtx.unlock();
+    done.fetch_add(1);
+}
+
+BOOST_AUTO_TEST_CASE(test_mutex_uncontended)
+{
+    // Nobody else holds the lock: lock() completes without suspending
+    Scheduler scheduler;
+
+    Mutex mtx;
+    std::vector<int> order;
+    std::atomic<int> done{0};
+
+    // Same pattern as other IO tests: drive the coroutine before init(),
+    // it stops at the first IO and is resumed once run() submits it.
+    mutex_locked_incr(&scheduler, mtx, 10'000'000, 1, order, done).detach();
+
+    BOOST_CHECK(mtx.try_lock() == false); // still held inside the critical section
+    BOOST_CHECK_EQUAL(mtx.waiter_count(), 0u);
+
+    std::thread runner([&scheduler]() {
+        BOOST_REQUIRE_EQUAL(scheduler.init(16), YYASIO_OK);
+        scheduler.run();
+    });
+
+    auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (done.load() == 0 && std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+
+    BOOST_CHECK_EQUAL(done.load(), 1);
+    BOOST_CHECK_EQUAL(order.size(), 1u);
+    BOOST_CHECK_EQUAL(order[0], 1);
+    BOOST_CHECK(mtx.try_lock() == true); // released after unlock() with no waiters
+    mtx.unlock();
+    scheduler.stop();
+    runner.join();
+}
+
+BOOST_AUTO_TEST_CASE(test_mutex_fifo_order)
+{
+    // Coroutines launched in order 0 -> 1 -> 2 -> 3:
+    // holder 0 keeps the lock for 100ms, so 1..3 suspend in lock() and must
+    // be woken in strict FIFO order by the ownership transfers in unlock().
+    Scheduler scheduler;
+
+    Mutex mtx;
+    std::vector<int> order;
+    std::atomic<int> done{0};
+
+    long hold_ns = 100'000'000; // 100ms, holder 0 only
+    mutex_locked_incr(&scheduler, mtx, hold_ns, 0, order, done).detach();
+    BOOST_CHECK(mtx.try_lock() == false);
+    mutex_locked_incr(&scheduler, mtx, 0, 1, order, done).detach();
+    mutex_locked_incr(&scheduler, mtx, 0, 2, order, done).detach();
+    mutex_locked_incr(&scheduler, mtx, 0, 3, order, done).detach();
+    BOOST_CHECK_EQUAL(mtx.waiter_count(), 3u);
+
+    std::thread runner([&scheduler]() {
+        BOOST_REQUIRE_EQUAL(scheduler.init(16), YYASIO_OK);
+        scheduler.run();
+    });
+
+    auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (done.load() < 4 && std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+
+    BOOST_CHECK_EQUAL(done.load(), 4);
+    BOOST_CHECK_EQUAL(order.size(), 4u);
+    for (int i = 0; i < 4; ++i)
+    {
+        BOOST_CHECK_EQUAL(order[i], i);
+    }
+    BOOST_CHECK_EQUAL(mtx.waiter_count(), 0u);
+    scheduler.stop();
+    runner.join();
+}
+
+BOOST_AUTO_TEST_CASE(test_mutex_try_lock)
+{
+    // try_lock fails while a coroutine holds the lock across a co_await point
+    Scheduler scheduler;
+
+    Mutex mtx;
+    std::vector<int> order;
+    std::atomic<int> done{0};
+
+    mutex_locked_incr(&scheduler, mtx, 50'000'000, 0, order, done).detach();
+
+    BOOST_CHECK(mtx.try_lock() == false);
+    BOOST_CHECK(mtx.try_lock() == false); // must stay false, no stealing
+
+    std::thread runner([&scheduler]() {
+        BOOST_REQUIRE_EQUAL(scheduler.init(16), YYASIO_OK);
+        scheduler.run();
+    });
+
+    auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (done.load() == 0 && std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+
+    // After the holder unlocked, try_lock succeeds
+    BOOST_CHECK(mtx.try_lock() == true);
+    mtx.unlock();
+    scheduler.stop();
+    runner.join();
+}
+
+// Helper coroutine: acquire via lock_guard(), hold for hold_ns, record tag.
+// The guard is scoped so its destructor calls unlock() at the closing brace.
+Task<void> guard_locked_incr(Scheduler* scheduler, Mutex& mtx, long hold_ns,
+                             int tag, std::vector<int>& order, std::atomic<int>& done)
+{
+    {
+        auto guard = co_await mtx.lock_guard();
+        if (hold_ns > 0)
+        {
+            struct __kernel_timespec ts = { .tv_sec = hold_ns / 1000000000L, .tv_nsec = hold_ns % 1000000000L };
+            co_await timeout(scheduler, &ts);
+        }
+        order.push_back(tag);
+    } // ~LockGuard unlocks here, before done is bumped
+    done.fetch_add(1);
+}
+
+BOOST_AUTO_TEST_CASE(test_mutex_lock_guard_scoped)
+{
+    // Single coroutine: lock_guard() acquires without contending, and the
+    // destructor releases the lock automatically at scope exit (no manual unlock).
+    Scheduler scheduler;
+
+    Mutex mtx;
+    std::vector<int> order;
+    std::atomic<int> done{0};
+
+    guard_locked_incr(&scheduler, mtx, 10'000'000, 1, order, done).detach();
+    BOOST_CHECK(mtx.try_lock() == false); // held inside the scope
+
+    std::thread runner([&scheduler]() {
+        BOOST_REQUIRE_EQUAL(scheduler.init(16), YYASIO_OK);
+        scheduler.run();
+    });
+
+    auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (done.load() == 0 && std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+
+    BOOST_CHECK_EQUAL(done.load(), 1);
+    BOOST_CHECK_EQUAL(order.size(), 1u);
+    BOOST_CHECK_EQUAL(order[0], 1);
+    BOOST_CHECK(mtx.try_lock() == true); // released by ~LockGuard
+    mtx.unlock();
+    scheduler.stop();
+    runner.join();
+}
+
+BOOST_AUTO_TEST_CASE(test_mutex_lock_guard_fifo)
+{
+    // Four coroutines guarded by lock_guard: holder 0 keeps the lock for 100ms,
+    // so 1..3 suspend in lock_guard() and are handed ownership in strict FIFO
+    // order as each ~LockGuard fires unlock() at scope exit.
+    Scheduler scheduler;
+
+    Mutex mtx;
+    std::vector<int> order;
+    std::atomic<int> done{0};
+
+    long hold_ns = 100'000'000; // 100ms, holder 0 only
+    guard_locked_incr(&scheduler, mtx, hold_ns, 0, order, done).detach();
+    guard_locked_incr(&scheduler, mtx, 0, 1, order, done).detach();
+    guard_locked_incr(&scheduler, mtx, 0, 2, order, done).detach();
+    guard_locked_incr(&scheduler, mtx, 0, 3, order, done).detach();
+    BOOST_CHECK_EQUAL(mtx.waiter_count(), 3u);
+
+    std::thread runner([&scheduler]() {
+        BOOST_REQUIRE_EQUAL(scheduler.init(16), YYASIO_OK);
+        scheduler.run();
+    });
+
+    auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (done.load() < 4 && std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+
+    BOOST_CHECK_EQUAL(done.load(), 4);
+    BOOST_CHECK_EQUAL(order.size(), 4u);
+    for (int i = 0; i < 4; ++i)
+    {
+        BOOST_CHECK_EQUAL(order[i], i);
+    }
+    BOOST_CHECK_EQUAL(mtx.waiter_count(), 0u);
+    BOOST_CHECK(mtx.try_lock() == true); // fully released after last scope exit
+    mtx.unlock();
+    scheduler.stop();
+    runner.join();
+}
+
 BOOST_AUTO_TEST_SUITE_END()

@@ -12,6 +12,7 @@
 - **单线程事件循环**：`Scheduler` 以单线程驱动 io_uring，模型简单、无锁竞争。
 - **协程调试能力**（编译期开关）：异常时打印硬件栈回溯与协程调用链、协程生命周期日志。
 - **Event 原语**：`Event<T>` 支持在一个协程中等待、在另一个协程中唤醒。
+- **Mutex 原语**：协程互斥锁，支持临界区跨 `co_await` 点挂起，等待者按 FIFO 唤醒。
 
 ## 环境要求
 
@@ -121,6 +122,31 @@ yyasio::Task<void> setter(yyasio::Event<int>& e) {
 }
 ```
 
+### Mutex 原语
+
+保护跨 `co_await` 点的临界区（普通 `std::mutex` 无法跨越挂起点）：
+
+```cpp
+yyasio::Mutex mtx;
+
+co_await mtx.lock();   // 锁空闲则立即返回；否则挂起
+// ... 临界区，可以 co_await 其他异步操作 ...
+mtx.unlock(); // 排在队首的等待者先获得锁
+
+if (mtx.try_lock()) { ... mtx.unlock(); }  // 非阻塞尝试加锁
+```
+
+优先用 RAII 守卫 `lock_guard()`，避免在临界区里忘了 `unlock()`（或中途 `co_return`/异常路径漏解）：
+
+```cpp
+{
+    auto guard = co_await mtx.lock_guard(); // RAII
+    // ... 临界区，可调用其他协程或 co_await  ...
+}
+```
+
+采用**所有权转移** + FIFO 等待队列：`unlock()` 不会把锁交给尚未排队的 `lock()` 调用者（防插队）。注意与 `Scheduler` 一致，`Mutex` **非线程安全**，共享同一把锁的协程必须跑在同一个调度器（同一线程）上；另外锁若在协程帧中声明，需保证帧存活期覆盖所有等待者，见 [`usage.cpp`](./usage.cpp) 的 `mutex_demo` / `lock_guard_demo`。
+
 ### 可用异步 API
 
 均为返回 awaiter 的自由函数，`co_await` 后得到 `int` 结果（io_uring 风格：成功为返回值，失败为 `-errno`）：
@@ -139,6 +165,9 @@ yyasio::Task<void> setter(yyasio::Event<int>& e) {
 | `renameat(sched, olddirfd, old, newdirfd, new, flags=0)` | 重命名 |
 | `unlinkat(sched, dirfd, path, flags=0)` | 删除 |
 | `cancel_fd(sched, fd, flags=0)` | 取消某 fd 上的在途请求 |
+| `mutex.[un]lock()` | 协程互斥锁加锁（不可用则挂起，FIFO 唤醒） |
+| `guard = co_await mutex.lock_guard()` | RAII 加锁，返回 `LockGuard`，离开作用域自动解锁 |
+| `mutex.unlock()` / `mutex.try_lock()` | 解锁（转移所有权给队首等待者）/ 非阻塞尝试加锁 |
 | `current_coro_id()` | 取当前协程地址作为 ID |
 
 ### 编译期宏
