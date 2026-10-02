@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cassert>
 #include <cstdint>
 #include <cstring>
 #include <ctime>
@@ -254,31 +255,45 @@ public:
     struct Awaiter
     {
         Awaiter(Event* event): _event(event) {}
-        bool await_ready() const noexcept { return false; }
+        bool await_ready() const noexcept {
+            // if has pending value, return true to skip suspend coroutine
+            // else, return false to suspend coroutine
+            return _event->_pending;
+        }
         bool await_suspend(std::coroutine_handle<> handle) noexcept {
+            assert (!_event->_coro);
             _event->_coro = handle;
             return true;
         }
         T await_resume() const noexcept {
             _event->_coro = nullptr;
+            _event->_pending = false;
             return _event->_value;
         }
         Event* _event;
     };
 
+    // CAUTION: only allow one coroutine waiting on this event
     Awaiter wait() { return Awaiter(this); }
 
+    // CAUTION: if set() is called multiple times before the coroutine is resumed,
+    // the last value will be returned and previous set values will be discarded.
     void set(T value)
     {
+        _value = value;
         if (_coro)
         {
-            _value = value;
             _coro.resume();
+        }
+        else
+        {
+            _pending = true;
         }
     }
 private:
     std::coroutine_handle<> _coro {};
-    T _value;
+    T _value {};
+    bool _pending = false;
 };
 
 struct Mutex

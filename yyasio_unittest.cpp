@@ -82,6 +82,47 @@ BOOST_AUTO_TEST_CASE(test_event_multiple_resumes)
     BOOST_CHECK_EQUAL(results[2], 3);
 }
 
+// 复现问题：协程1 set 某个 Event 时，协程2 还没有 co_await 在这个 Event 上
+// （它正 co_await 在另一个 Event 上），这个值就被直接丢弃了；
+// 协程2 随后 co_await 这个 Event 时会永久挂起。
+// 期望语义：set 的值应当被记住，后到的 waiter 立刻拿到它，事件不丢。
+Task<void> waiter_on_other_event_then_target(Event<int>& gate, Event<int>& target,
+                                             std::atomic<int>& result)
+{
+    // 先挂在另一个 Event 上，此刻 target 上一个 waiter 都没有
+    co_await gate.wait();
+    // 被唤醒之后才开始等 target，而 target 早就被 set 过了
+    int val = co_await target.wait();
+    result.store(val);
+}
+
+BOOST_AUTO_TEST_CASE(test_event_set_before_waiter_not_lost)
+{
+    Event<int> gate;
+    Event<int> target;
+    std::atomic<int> result{-1};
+
+    // detach() 会同步执行到第一个 co_await 才挂起，所以返回时 gate 已经登记了 waiter。
+    // 整个用例不使用 scheduler/线程，时序完全确定，可稳定复现。
+    waiter_on_other_event_then_target(gate, target, result).detach();
+    BOOST_REQUIRE_EQUAL(result.load(), -1);
+
+    // 协程2 还阻塞在 gate 上，target 没有任何 waiter，此时 set 不能被丢弃
+    target.set(42);
+    BOOST_REQUIRE_EQUAL(result.load(), -1); // 还没轮到协程2 运行
+
+    // 唤醒协程2，它接着才 co_await target
+    gate.set(0);
+
+    // 如果事件没有丢，协程2 应当立刻拿到 42 并跑完
+    BOOST_CHECK_EQUAL(result.load(), 42);
+
+    /* 清理：若事件被丢弃（当前实现），协程2 会永久挂起在 target 上，
+     * 协程帧不析构，ASan 会报 leak。这里再 set 一次让它跑完并自毁帧。
+     */
+    target.set(42);
+}
+
 BOOST_AUTO_TEST_CASE(placeholder)
 {
     // TODO: add more test cases
