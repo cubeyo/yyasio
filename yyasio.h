@@ -10,10 +10,12 @@
 #include <queue>
 #include <memory>
 #include <sys/socket.h>
+#include <concepts>
 #include <unordered_map>
 #include <liburing.h>
 #include <variant>
 #include <atomic>
+#include <utility>
 
 #ifndef PRINT_STACK_ON_EXCEPTION
 #define PRINT_STACK_ON_EXCEPTION 0
@@ -265,10 +267,11 @@ public:
             _event->_coro = handle;
             return true;
         }
-        T await_resume() const noexcept {
+        T await_resume() const
+        {
             _event->_coro = nullptr;
             _event->_pending = false;
-            return _event->_value;
+            return std::move(_event->_value);
         }
         Event* _event;
     };
@@ -280,7 +283,7 @@ public:
     // the last value will be returned and previous set values will be discarded.
     void set(T value)
     {
-        _value = value;
+        _value = std::move(value);
         if (_coro)
         {
             _coro.resume();
@@ -444,7 +447,9 @@ template<typename T>
 struct promise_return_base
 {
     T result;
-    void return_value(T value) { result = value; }
+    // value arrives by value, so move it in: a copy assignment here would make
+    // move-only results (unique_ptr and friends) fail to compile
+    void return_value(T value) { result = std::move(value); }
 };
 
 template<>
@@ -455,7 +460,7 @@ struct promise_return_base<void>
 };
 
 template<typename T>
-struct Task
+struct Task 
 {
     struct promise_type: public promise_return_base<T>
     {
@@ -552,18 +557,18 @@ struct Task
                 return _callee;
             }
 
-            T await_resume() const noexcept requires (!std::same_as<T, void>)
+            T await_resume() const requires (!std::same_as<T, void>)
             {
                 // awaiter inside parent's frame,
                 // can safely destroy sub coroutine's frame here
                 debug_coro("subcoro finished:", _callee);
-                auto result = _callee.promise().result;
+                auto result = std::move(_callee.promise().result);
                 debug_coro("destroy coro:", _callee);
                 detail::DebugInfoStore::remove_coro(_callee.address());
                 _callee.destroy();
-                return static_cast<T>(result);
+                return static_cast<T>(std::move(result));
             }
-            void await_resume() const noexcept requires std::same_as<T, void>
+            void await_resume() const requires std::same_as<T, void>
             {
                 debug_coro("subcoro finished:", _callee);
                 debug_coro("destroy coro:", _callee);

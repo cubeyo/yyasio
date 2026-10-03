@@ -4,6 +4,8 @@
 #include "yyasio.h"
 #include <array>
 #include <atomic>
+#include <memory>
+#include <string>
 #include <thread>
 #include <chrono>
 #include <cstring>
@@ -1161,6 +1163,499 @@ BOOST_AUTO_TEST_CASE(test_mutex_lock_guard_fifo)
     BOOST_CHECK_EQUAL(mtx.waiter_count(), 0u);
     BOOST_CHECK(mtx.try_lock() == true); // fully released after last scope exit
     mtx.unlock();
+    scheduler.stop();
+    runner.join();
+}
+
+// ==================== Move-only Task Result Tests ====================
+//
+// Task<T> must also work when T cannot be copied (unique_ptr and friends): the
+// value has to travel from `co_return` through the child's promise result into
+// the awaiting parent using moves only.
+
+static const int MOVE_ONLY_MAGIC = 0x5AA5;
+
+// A non-copyable type counting its live owners: an accidental copy in the
+// result path does not even compile, and an accidental drop/duplicate shows up
+// as owners() != 1.
+class MoveOnlyToken
+{
+public:
+    MoveOnlyToken() = default; // Task<T>'s promise default-constructs `result`
+    explicit MoveOnlyToken(int v): _value(v), _owner(true) { owners() += 1; }
+    MoveOnlyToken(const MoveOnlyToken&) = delete;
+    MoveOnlyToken& operator=(const MoveOnlyToken&) = delete;
+    MoveOnlyToken(MoveOnlyToken&& other) noexcept: _value(other._value), _owner(other._owner)
+    { other._owner = false; } // ownership handed over, total unchanged
+    MoveOnlyToken& operator=(MoveOnlyToken&& other) noexcept
+    {
+        if (_owner) owners() -= 1; // release what we held before taking over
+        _value = other._value;
+        _owner = other._owner;
+        other._owner = false;
+        return *this;
+    }
+    ~MoveOnlyToken() { if (_owner) owners() -= 1; }
+    int value() const { return _value; }
+    static int& owners() { static int n = 0; return n; }
+private:
+    int _value = 0;
+    bool _owner = false;
+};
+
+// Counts live heap objects so we can check a unique_ptr result is destroyed
+// exactly once (no leak, no double free).
+class ReleaseProbe
+{
+public:
+    ReleaseProbe() { ++live(); }
+    ~ReleaseProbe() { --live(); }
+    ReleaseProbe(const ReleaseProbe&) = delete;
+    ReleaseProbe& operator=(const ReleaseProbe&) = delete;
+    static int& live() { static int n = 0; return n; }
+};
+
+Task<std::unique_ptr<int>> make_int_ptr_sync()
+{
+    co_return std::make_unique<int>(MOVE_ONLY_MAGIC);
+}
+
+Task<void> take_int_ptr_sync(std::unique_ptr<int>& out, std::atomic<bool>& done)
+{
+    out = co_await make_int_ptr_sync();
+    done.store(true);
+}
+
+BOOST_AUTO_TEST_CASE(test_task_move_only_result_sync)
+{
+    // No scheduler: the child has no IO point, so the whole
+    // parent -> child -> parent handoff runs synchronously inside detach().
+    std::unique_ptr<int> out;
+    std::atomic<bool> done{false};
+
+    take_int_ptr_sync(out, done).detach();
+
+    BOOST_REQUIRE(done.load());
+    BOOST_REQUIRE(out != nullptr); // ownership reached the awaiting parent
+    BOOST_CHECK_EQUAL(*out, MOVE_ONLY_MAGIC);
+}
+
+Task<std::unique_ptr<int>> maybe_int_ptr_sync(bool produce)
+{
+    if (!produce) co_return nullptr; // an empty move-only result must survive too
+    co_return std::make_unique<int>(MOVE_ONLY_MAGIC);
+}
+
+Task<void> take_optional_ptr_sync(std::unique_ptr<int>& out, bool produce, std::atomic<bool>& done)
+{
+    out = co_await maybe_int_ptr_sync(produce);
+    done.store(true);
+}
+
+BOOST_AUTO_TEST_CASE(test_task_move_only_result_null_sync)
+{
+    // co_return nullptr goes through return_value(T value) as well
+    std::unique_ptr<int> out = std::make_unique<int>(-1);
+    std::atomic<bool> done{false};
+
+    take_optional_ptr_sync(out, false, done).detach();
+
+    BOOST_REQUIRE(done.load());
+    BOOST_CHECK(out == nullptr);
+
+    // and the non-empty branch still works
+    done.store(false);
+    take_optional_ptr_sync(out, true, done).detach();
+    BOOST_REQUIRE(done.load());
+    BOOST_REQUIRE(out != nullptr);
+    BOOST_CHECK_EQUAL(*out, MOVE_ONLY_MAGIC);
+}
+
+Task<std::unique_ptr<int>> make_int_ptr_after_io(Scheduler* scheduler, int value)
+{
+    struct __kernel_timespec ts = { .tv_sec = 0, .tv_nsec = 10'000'000 }; // 10ms
+    co_await timeout(scheduler, &ts);
+    // the value is only produced after the coroutine was resumed by the loop
+    co_return std::make_unique<int>(value);
+}
+
+Task<void> take_int_ptr_after_io(Scheduler* scheduler, std::unique_ptr<int>& out, std::atomic<bool>& done)
+{
+    out = co_await make_int_ptr_after_io(scheduler, MOVE_ONLY_MAGIC);
+    done.store(true);
+}
+
+BOOST_AUTO_TEST_CASE(test_task_move_only_result_async)
+{
+    // The move-only result is produced after an io_uring round trip: the value
+    // must survive suspension in the child frame and be moved out in await_resume.
+    Scheduler scheduler;
+
+    std::unique_ptr<int> out;
+    std::atomic<bool> done{false};
+    take_int_ptr_after_io(&scheduler, out, done).detach();
+
+    std::thread runner([&scheduler]() {
+        BOOST_REQUIRE_EQUAL(scheduler.init(16), YYASIO_OK);
+        scheduler.run();
+    });
+
+    auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (!done.load() && std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+
+    BOOST_REQUIRE(done.load());
+    BOOST_REQUIRE(out != nullptr);
+    BOOST_CHECK_EQUAL(*out, MOVE_ONLY_MAGIC);
+    scheduler.stop();
+    runner.join();
+}
+
+Task<MoveOnlyToken> make_token_after_io(Scheduler* scheduler, int value)
+{
+    struct __kernel_timespec ts = { .tv_sec = 0, .tv_nsec = 10'000'000 }; // 10ms
+    co_await timeout(scheduler, &ts);
+    co_return MoveOnlyToken(value);
+}
+
+Task<void> take_token_after_io(Scheduler* scheduler, int base,
+                               std::atomic<int>& held_owners,
+                               std::atomic<int>& released_owners,
+                               std::atomic<bool>& done)
+{
+    {
+        auto token = co_await make_token_after_io(scheduler, MOVE_ONLY_MAGIC);
+        BOOST_CHECK_EQUAL(token.value(), MOVE_ONLY_MAGIC);
+        // exactly one instance holds the resource: the child frame was already
+        // destroyed in await_resume, nothing was duplicated on the way out
+        held_owners.store(MoveOnlyToken::owners() - base);
+    } // the parent's local dies here and releases the resource
+    released_owners.store(MoveOnlyToken::owners() - base);
+    done.store(true);
+}
+
+BOOST_AUTO_TEST_CASE(test_task_move_only_token_ownership)
+{
+    Scheduler scheduler;
+
+    const int base = MoveOnlyToken::owners();
+    std::atomic<int> held_owners{-1};
+    std::atomic<int> released_owners{-1};
+    std::atomic<bool> done{false};
+    take_token_after_io(&scheduler, base, held_owners, released_owners, done).detach();
+
+    std::thread runner([&scheduler]() {
+        BOOST_REQUIRE_EQUAL(scheduler.init(16), YYASIO_OK);
+        scheduler.run();
+    });
+
+    auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (!done.load() && std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+
+    BOOST_REQUIRE(done.load());
+    BOOST_CHECK_EQUAL(held_owners.load(), 1);
+    BOOST_CHECK_EQUAL(released_owners.load(), 0);
+    BOOST_CHECK_EQUAL(MoveOnlyToken::owners(), base); // the coroutine frames left nothing behind
+    scheduler.stop();
+    runner.join();
+}
+
+Task<std::unique_ptr<std::string>> inner_string_ptr_coro(const char* text)
+{
+    co_return std::make_unique<std::string>(text);
+}
+
+// Middle coroutine: takes the inner move-only result and forwards it later.
+// Note `co_return p;` would be ill-formed for a move-only T (return_value takes
+// its argument by value), the forward has to move explicitly.
+Task<std::unique_ptr<std::string>> forward_string_ptr_coro(Scheduler* scheduler, const char* text,
+                                                           std::atomic<bool>& inner_checked)
+{
+    auto p = co_await inner_string_ptr_coro(text);
+    BOOST_REQUIRE(p != nullptr);
+    BOOST_CHECK_EQUAL(*p, text);
+    inner_checked.store(true);
+
+    // keep the move-only result alive across another suspension point: it sits
+    // in this coroutine's frame while the timeout is in flight
+    struct __kernel_timespec ts = { .tv_sec = 0, .tv_nsec = 10'000'000 }; // 10ms
+    co_await timeout(scheduler, &ts);
+    BOOST_REQUIRE(p != nullptr);
+    BOOST_CHECK_EQUAL(*p, text);
+
+    co_return std::move(p);
+}
+
+Task<void> take_forwarded_ptr_coro(Scheduler* scheduler, std::unique_ptr<std::string>& out,
+                                   std::atomic<bool>& inner_checked, std::atomic<bool>& done)
+{
+    out = co_await forward_string_ptr_coro(scheduler, "move-only chain", inner_checked);
+    done.store(true);
+}
+
+BOOST_AUTO_TEST_CASE(test_task_move_only_forward_nested)
+{
+    // grandchild -> child -> parent: the value is moved through two frames and
+    // held across a suspension point before being returned again.
+    Scheduler scheduler;
+
+    std::unique_ptr<std::string> out;
+    std::atomic<bool> inner_checked{false};
+    std::atomic<bool> done{false};
+    take_forwarded_ptr_coro(&scheduler, out, inner_checked, done).detach();
+
+    std::thread runner([&scheduler]() {
+        BOOST_REQUIRE_EQUAL(scheduler.init(16), YYASIO_OK);
+        scheduler.run();
+    });
+
+    auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (!done.load() && std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+
+    BOOST_REQUIRE(done.load());
+    BOOST_CHECK(inner_checked.load());
+    BOOST_REQUIRE(out != nullptr);
+    BOOST_CHECK_EQUAL(*out, "move-only chain");
+    scheduler.stop();
+    runner.join();
+}
+
+Task<std::unique_ptr<ReleaseProbe>> make_probe_ptr_coro(Event<int>& gate, std::atomic<bool>& produced)
+{
+    co_await gate.wait(); // suspend until somebody sets the event
+    produced.store(true);
+    co_return std::make_unique<ReleaseProbe>();
+}
+
+BOOST_AUTO_TEST_CASE(test_task_move_only_detached_result_released)
+{
+    // Fire-and-forget: nobody co_awaits the Task, so the move-only result is
+    // produced in the frame and destroyed together with it, exactly once.
+    const int base = ReleaseProbe::live();
+    Event<int> gate;
+    std::atomic<bool> produced{false};
+
+    auto task = make_probe_ptr_coro(gate, produced);
+    task.detach(); // runs until co_await gate.wait()
+    BOOST_CHECK(!produced.load());
+    BOOST_CHECK_EQUAL(ReleaseProbe::live(), base);
+
+    gate.set(1); // runs to completion, the frame self-destroys in FinalAwaiter
+    BOOST_CHECK(produced.load());
+    BOOST_CHECK_EQUAL(ReleaseProbe::live(), base);
+}
+
+// ==================== Move-only Event Value Tests ====================
+//
+// Event<T> publishes its value with moves only (set() moves the parameter in,
+// await_resume() moves it out), so a non-copyable T works while every copyable
+// T keeps behaving as before. The helpers MoveOnlyToken/ReleaseProbe above are
+// reused here.
+
+// Waits for the probe and reports whether it was alive at hand-off time.
+Task<void> consume_probe_ptr(Event<std::unique_ptr<ReleaseProbe>>& event,
+                             std::atomic<ReleaseProbe*>& seen,
+                             std::atomic<bool>& alive_at_handoff)
+{
+    auto p = co_await event.wait();
+    seen.store(p.get());
+    alive_at_handoff.store(ReleaseProbe::live() > 0);
+} // p dies together with the coroutine frame: the probe is released here
+
+BOOST_AUTO_TEST_CASE(test_event_move_only_ptr_handoff)
+{
+    // A move-only value published to a coroutine that is suspended on the Event
+    const int base = ReleaseProbe::live();
+    Event<std::unique_ptr<ReleaseProbe>> event;
+    std::atomic<ReleaseProbe*> seen{nullptr};
+    std::atomic<bool> alive_at_handoff{false};
+
+    consume_probe_ptr(event, seen, alive_at_handoff).detach(); // suspends inside wait()
+    BOOST_CHECK(seen.load() == nullptr);
+    BOOST_CHECK_EQUAL(ReleaseProbe::live(), base);
+
+    auto probe = std::make_unique<ReleaseProbe>();
+    ReleaseProbe* expected = probe.get();
+    event.set(std::move(probe)); // resumes the waiter, which releases the probe before returning
+
+    BOOST_CHECK(seen.load() == expected); // ownership reached the waiter
+    BOOST_CHECK(alive_at_handoff.load());
+    BOOST_CHECK(probe == nullptr);        // the publisher gave it up
+    BOOST_CHECK_EQUAL(ReleaseProbe::live(), base); // released exactly once: no leak, no double free
+}
+
+Task<void> take_ptr_after_gate(Event<int>& gate, Event<std::unique_ptr<int>>& source, std::atomic<int>& seen)
+{
+    co_await gate.wait();
+    auto p = co_await source.wait();
+    seen.store(p ? *p : -1);
+}
+
+BOOST_AUTO_TEST_CASE(test_event_move_only_set_before_wait)
+{
+    // The value is published while no coroutine is waiting yet: it must stay
+    // pending inside the Event and be moved out by the waiter that arrives later.
+    Event<int> gate;
+    Event<std::unique_ptr<int>> source;
+    std::atomic<int> seen{0};
+
+    take_ptr_after_gate(gate, source, seen).detach(); // suspended on gate
+
+    auto value = std::make_unique<int>(MOVE_ONLY_MAGIC);
+    source.set(std::move(value));
+    BOOST_CHECK(value == nullptr);   // moved into the Event
+    BOOST_CHECK_EQUAL(seen.load(), 0); // the waiter has not run yet
+
+    gate.set(1);                     // now it reaches source.wait() and takes the pending value
+    BOOST_CHECK_EQUAL(seen.load(), MOVE_ONLY_MAGIC);
+}
+
+BOOST_AUTO_TEST_CASE(test_event_move_only_overwrite_releases_previous)
+{
+    // Event holds a single pending value: overwriting it must destroy the
+    // previous one exactly once and hand over the last published value.
+    const int base = ReleaseProbe::live();
+    Event<std::unique_ptr<ReleaseProbe>> event;
+
+    auto first = std::make_unique<ReleaseProbe>();
+    ReleaseProbe* first_addr = first.get();
+    event.set(std::move(first)); // nobody waiting yet -> stored as pending
+    BOOST_CHECK_EQUAL(ReleaseProbe::live(), base + 1);
+
+    auto second = std::make_unique<ReleaseProbe>();
+    ReleaseProbe* second_addr = second.get();
+    event.set(std::move(second)); // replaces the pending value
+    BOOST_CHECK_EQUAL(ReleaseProbe::live(), base + 1); // the first was released, not leaked
+
+    std::atomic<ReleaseProbe*> seen{nullptr};
+    std::atomic<bool> alive_at_handoff{false};
+    consume_probe_ptr(event, seen, alive_at_handoff).detach(); // pending -> no suspension
+
+    BOOST_CHECK(seen.load() == second_addr);
+    BOOST_CHECK(seen.load() != first_addr);
+    BOOST_CHECK(alive_at_handoff.load());
+    BOOST_CHECK_EQUAL(ReleaseProbe::live(), base);
+}
+
+Task<void> take_token_from_event(Event<MoveOnlyToken>& event, int base,
+                                 std::atomic<int>& held_owners,
+                                 std::atomic<int>& seen_value,
+                                 std::atomic<bool>& done)
+{
+    auto token = co_await event.wait();
+    seen_value.store(token.value());
+    // the Event still owns a moved-from shell: nobody duplicated the resource
+    held_owners.store(MoveOnlyToken::owners() - base);
+    done.store(true);
+} // token released here, back to base
+
+BOOST_AUTO_TEST_CASE(test_event_move_only_token_ownership)
+{
+    Event<MoveOnlyToken> event;
+    const int base = MoveOnlyToken::owners();
+    std::atomic<int> held_owners{-1};
+    std::atomic<int> seen_value{0};
+    std::atomic<bool> done{false};
+
+    take_token_from_event(event, base, held_owners, seen_value, done).detach();
+    BOOST_CHECK_EQUAL(MoveOnlyToken::owners(), base); // still suspended, nothing published
+
+    event.set(MoveOnlyToken(MOVE_ONLY_MAGIC));
+
+    BOOST_REQUIRE(done.load());
+    BOOST_CHECK_EQUAL(seen_value.load(), MOVE_ONLY_MAGIC);
+    BOOST_CHECK_EQUAL(held_owners.load(), 1); // exactly one owner during hand-off
+    BOOST_CHECK_EQUAL(MoveOnlyToken::owners(), base);
+}
+
+static const char* EVENT_STRING_VALUE = "copyable but not trivially copyable"; // > 15 chars: heap buffer, so a move really steals
+
+Task<void> take_string_from_event(Event<std::string>& event, std::string& out, std::atomic<bool>& done)
+{
+    out = co_await event.wait();
+    done.store(true);
+}
+
+BOOST_AUTO_TEST_CASE(test_event_copyable_nontrivial_still_works)
+{
+    // Regression guard for the move-based set()/await_resume(): std::string is
+    // copyable but NOT trivially copyable, it must still work, and publishing an
+    // lvalue must still leave the publisher untouched (copy in, not move).
+    Event<std::string> event;
+    std::string published = EVENT_STRING_VALUE;
+    std::string out;
+    std::atomic<bool> done{false};
+
+    take_string_from_event(event, out, done).detach();
+    event.set(published); // lvalue
+
+    BOOST_REQUIRE(done.load());
+    BOOST_CHECK_EQUAL(out, EVENT_STRING_VALUE);
+    BOOST_CHECK(!published.empty()); // the publisher kept its own copy
+
+    // an rvalue publisher hands the value over instead of copying it
+    std::string moved_out;
+    Event<std::string> event2;
+    std::atomic<bool> done2{false};
+    std::string source = EVENT_STRING_VALUE;
+    take_string_from_event(event2, moved_out, done2).detach();
+    event2.set(std::move(source));
+
+    BOOST_REQUIRE(done2.load());
+    BOOST_CHECK_EQUAL(moved_out, EVENT_STRING_VALUE);
+    BOOST_CHECK(source.empty()); // moved out of the publisher
+}
+
+Task<void> publish_ptr_after_io(Scheduler* scheduler, Event<std::unique_ptr<int>>& event,
+                                int value, std::atomic<bool>& published)
+{
+    struct __kernel_timespec ts = { .tv_sec = 0, .tv_nsec = 10'000'000 }; // 10ms
+    co_await timeout(scheduler, &ts);
+    published.store(true);
+    event.set(std::make_unique<int>(value)); // resumes the waiting consumer
+}
+
+Task<void> consume_ptr_in_loop(Scheduler* scheduler, Event<std::unique_ptr<int>>& event,
+                               std::atomic<int>& seen, std::atomic<bool>& done)
+{
+    struct __kernel_timespec ts = { .tv_sec = 0, .tv_nsec = 10'000'000 }; // 10ms
+    co_await timeout(scheduler, &ts);
+    auto p = co_await event.wait();
+    seen.store(p ? *p : -1);
+    done.store(true);
+}
+
+BOOST_AUTO_TEST_CASE(test_event_move_only_across_scheduler_coroutines)
+{
+    // Producer and consumer both driven by the io_uring loop: the move-only value
+    // is created in one coroutine and destroyed in another.
+    Scheduler scheduler;
+
+    Event<std::unique_ptr<int>> event;
+    std::atomic<bool> published{false};
+    std::atomic<int> seen{0};
+    std::atomic<bool> done{false};
+
+    consume_ptr_in_loop(&scheduler, event, seen, done).detach();
+    publish_ptr_after_io(&scheduler, event, MOVE_ONLY_MAGIC, published).detach();
+
+    std::thread runner([&scheduler]() {
+        BOOST_REQUIRE_EQUAL(scheduler.init(16), YYASIO_OK);
+        scheduler.run();
+    });
+
+    auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (!done.load() && std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+
+    BOOST_CHECK(published.load());
+    BOOST_CHECK_EQUAL(seen.load(), MOVE_ONLY_MAGIC);
     scheduler.stop();
     runner.join();
 }
