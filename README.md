@@ -12,6 +12,7 @@
 - **单线程事件循环**：`Scheduler` 以单线程驱动 io_uring，模型简单、无锁竞争。
 - **协程调试能力**（编译期开关）：异常时打印硬件栈回溯与协程调用链、协程生命周期日志。
 - **Event 原语**：`Event<T>` 支持在一个协程中等待、在另一个协程中唤醒。
+- **TimeoutEvent 原语**：可等待的定时器。`co_await ev.wait_until(500ms)` 与 `ev.set()` 谁先到都只唤醒一次；被 `set()` 抢先时会自动 `abandon()` 掉未触发的定时器，迟到的 CQE 不会二次唤醒协程。
 - **Mutex 原语**：协程互斥锁，支持临界区跨 `co_await` 点挂起，等待者按 FIFO 唤醒。
 
 ## 环境要求
@@ -20,9 +21,10 @@
 |---|---|---|
 | 操作系统 | Linux 内核 **5.11+** | io_uring 基础操作 |
 | 内核 5.19+ | `cancel_fd` | 异步取消（`IORING_ASYNC_CANCEL_FD`） |
+| 内核 **5.5+** | `TimeoutEvent` / `abandon()` | 依赖 `IORING_OP_ASYNC_CANCEL` 按 `user_data` 取消（`flags = 0`）；`IORING_ASYNC_CANCEL_*` 匹配标志需更新内核，本库当前未使用 |
 | 内核 **6.0+** | 可选优化 | `IORING_SETUP_SINGLE_ISSUER` / `IORING_SETUP_DEFER_TASKRUN`；低版本内核会自动回退到无 flag 模式 |
 | 编译器 | GCC 10+（建议 GCC 11+） | 需支持 C++20 `std::coroutine`；GCC 11 不支持 requires 子句过滤成员函数，代码已做兼容 |
-| 依赖库 | `liburing` | 异步 I/O 后端 |
+| 依赖库 | `liburing` | 异步 I/O 后端。`abandon()` 用到 `io_uring_prep_cancel64()`：若你的 liburing 没有这个内联函数，可等价地手填 SQE（`opcode = IORING_OP_ASYNC_CANCEL` + `sqe->addr = user_data`），同 `cancel_fd` 在 liburing < 2.3 下的兼容路径 |
 | 依赖库 | `libunwind` | 仅在开启栈回溯宏时需要 |
 
 ## 构建方式
@@ -90,7 +92,7 @@ int main()
 }
 ```
 
-完整示例见 [`usage.cpp`](./usage.cpp)（含回声服务器、文件读写、超时轮询、协程 ID 获取等），协程与 API 的单元测试见 [`yyasio_unittest.cpp`](./yyasio_unittest.cpp)。
+完整示例见 [`usage.cpp`](./usage.cpp)（含回声服务器、文件读写、超时轮询、`TimeoutEvent`、协程 ID 获取等），协程与 API 的单元测试见 [`yyasio_unittest.cpp`](./yyasio_unittest.cpp)。
 
 ### 协程组合与生命周期
 
@@ -119,6 +121,24 @@ yyasio::Task<void> waiter(yyasio::Event<int>& e) {
 }
 yyasio::Task<void> setter(yyasio::Event<int>& e) {
     e.set(42);                    // 唤醒等待中的协程
+}
+```
+
+### TimeoutEvent 原语
+
+一个可等待的定时器，语义上是 `Event`（auto-reset 型，同 cppcoro 的 `async_auto_reset_event`）加上超时：等 `set()` 或等超时，**谁先到都只唤醒一次**。
+
+```cpp
+yyasio::TimeoutEvent ev(&scheduler);
+
+yyasio::Task<void> worker(yyasio::TimeoutEvent& e) {
+    co_await e.wait_until(std::chrono::milliseconds(500)); // 最多等 500ms
+    // ... 被 set() 叫起或被超时叫起，都会走到这里，且只走一次 ...
+}
+
+yyasio::Task<void> setter(yyasio::TimeoutEvent& e) {
+    // ... 做一些异步工作 ...
+    e.set();   // 提前唤醒 waiter；同时取消那个还没到期的定时器
 }
 ```
 
@@ -165,6 +185,9 @@ if (mtx.try_lock()) { ... mtx.unlock(); }  // 非阻塞尝试加锁
 | `renameat(sched, olddirfd, old, newdirfd, new, flags=0)` | 重命名 |
 | `unlinkat(sched, dirfd, path, flags=0)` | 删除 |
 | `cancel_fd(sched, fd, flags=0)` | 取消某 fd 上的在途请求 |
+| `ev.wait_until(duration)` | `TimeoutEvent`：最多等待 `duration`，可被 `set()` 提前唤醒，返回 `void` |
+| `ev.set()` | 唤醒等待中的协程，并 `abandon()` 掉未触发的定时器 |
+| `scheduler.abandon(index)` | 放弃 `schedule()` 返回的 index 对应的在途 IO（详见上文） |
 | `mutex.[un]lock()` | 协程互斥锁加锁（不可用则挂起，FIFO 唤醒） |
 | `guard = co_await mutex.lock_guard()` | RAII 加锁，返回 `LockGuard`，离开作用域自动解锁 |
 | `mutex.unlock()` / `mutex.try_lock()` | 解锁（转移所有权给队首等待者）/ 非阻塞尝试加锁 |

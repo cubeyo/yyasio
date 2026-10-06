@@ -4,6 +4,7 @@
 #include "yyasio.h"
 #include <array>
 #include <atomic>
+#include <limits>
 #include <memory>
 #include <string>
 #include <thread>
@@ -17,6 +18,16 @@
 #include <arpa/inet.h>
 
 using namespace yyasio;
+
+// Drives one scheduler the way every IO test needs it. init(), run() and shutdown()
+// all have to happen on the loop thread (the ring is set up SINGLE_ISSUER), which is
+// why the release lives here instead of after runner.join() in the test body.
+static void run_scheduler(Scheduler& scheduler)
+{
+    BOOST_REQUIRE_EQUAL(scheduler.init(16), YYASIO_OK);
+    scheduler.run();
+    scheduler.shutdown();
+}
 
 BOOST_AUTO_TEST_SUITE(YYasioTests)
 
@@ -155,8 +166,7 @@ BOOST_AUTO_TEST_CASE(test_openat)
     open_file_coro(&scheduler, fd).detach();
 
     std::thread runner([&scheduler]() {
-        BOOST_REQUIRE_EQUAL(scheduler.init(16), YYASIO_OK);
-        scheduler.run();
+        run_scheduler(scheduler);
     });
 
     auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
@@ -193,8 +203,7 @@ BOOST_AUTO_TEST_CASE(test_write)
     write_file_coro(&scheduler, fd, bytes_written).detach();
 
     std::thread runner([&scheduler]() {
-        BOOST_REQUIRE_EQUAL(scheduler.init(16), YYASIO_OK);
-        scheduler.run();
+        run_scheduler(scheduler);
     });
 
     auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
@@ -232,8 +241,7 @@ BOOST_AUTO_TEST_CASE(test_read)
     read_file_coro(&scheduler, fd, buffer, sizeof(buffer), bytes_read).detach();
 
     std::thread runner([&scheduler]() {
-        BOOST_REQUIRE_EQUAL(scheduler.init(16), YYASIO_OK);
-        scheduler.run();
+        run_scheduler(scheduler);
     });
 
     auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
@@ -269,8 +277,7 @@ BOOST_AUTO_TEST_CASE(test_close)
     close_file_coro(&scheduler, fd, close_result).detach();
 
     std::thread runner([&scheduler]() {
-        BOOST_REQUIRE_EQUAL(scheduler.init(16), YYASIO_OK);
-        scheduler.run();
+        run_scheduler(scheduler);
     });
 
     auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
@@ -323,8 +330,7 @@ BOOST_AUTO_TEST_CASE(test_file_io_combined)
     file_io_combined_coro(&scheduler, done).detach();
 
     std::thread runner([&scheduler]() {
-        BOOST_REQUIRE_EQUAL(scheduler.init(16), YYASIO_OK);
-        scheduler.run();
+        run_scheduler(scheduler);
     });
 
     auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
@@ -371,8 +377,7 @@ BOOST_AUTO_TEST_CASE(test_coroutine_return_value)
     // Run scheduler in background thread (run() is blocking)
     // init() and run() must be on the same thread (IORING_SETUP_SINGLE_ISSUER)
     std::thread runner([&scheduler]() {
-        BOOST_REQUIRE_EQUAL(scheduler.init(16), YYASIO_OK);
-        scheduler.run();
+        run_scheduler(scheduler);
     });
 
     // Wait for result with timeout
@@ -410,8 +415,7 @@ BOOST_AUTO_TEST_CASE(test_timeout)
     timeout_coro(&scheduler, timeout_ns, result, elapsed_ns).detach();
 
     std::thread runner([&scheduler]() {
-        BOOST_REQUIRE_EQUAL(scheduler.init(16), YYASIO_OK);
-        scheduler.run();
+        run_scheduler(scheduler);
     });
 
     auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
@@ -646,8 +650,7 @@ BOOST_AUTO_TEST_CASE(test_connect)
     connect_and_send_test(&scheduler, 18080, connect_result, write_result).detach();
 
     std::thread runner([&scheduler]() {
-        BOOST_REQUIRE_EQUAL(scheduler.init(16), YYASIO_OK);
-        scheduler.run();
+        run_scheduler(scheduler);
     });
 
     // Wait for both to complete (including read operation)
@@ -700,8 +703,7 @@ BOOST_AUTO_TEST_CASE(test_listen)
     listen_coro(&scheduler, listen_fd, listen_result).detach();
 
     std::thread runner([&scheduler]() {
-        BOOST_REQUIRE_EQUAL(scheduler.init(16), YYASIO_OK);
-        scheduler.run();
+        run_scheduler(scheduler);
     });
 
     auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
@@ -764,8 +766,7 @@ BOOST_AUTO_TEST_CASE(test_renameat)
     renameat_coro(&scheduler, AT_FDCWD, TEST_OLD_FILE_PATH, AT_FDCWD, TEST_NEW_FILE_PATH, rename_result).detach();
 
     std::thread runner([&scheduler]() {
-        BOOST_REQUIRE_EQUAL(scheduler.init(16), YYASIO_OK);
-        scheduler.run();
+        run_scheduler(scheduler);
     });
 
     auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
@@ -823,8 +824,7 @@ BOOST_AUTO_TEST_CASE(test_unlinkat)
     unlinkat_coro(&scheduler, AT_FDCWD, TEST_UNLINK_FILE_PATH, 0, unlink_result).detach();
 
     std::thread runner([&scheduler]() {
-        BOOST_REQUIRE_EQUAL(scheduler.init(16), YYASIO_OK);
-        scheduler.run();
+        run_scheduler(scheduler);
     });
 
     auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
@@ -857,8 +857,7 @@ BOOST_AUTO_TEST_CASE(test_unlinkat_nonexistent)
     unlinkat_nonexist_coro(&scheduler, unlink_result).detach();
 
     std::thread runner([&scheduler]() {
-        BOOST_REQUIRE_EQUAL(scheduler.init(16), YYASIO_OK);
-        scheduler.run();
+        run_scheduler(scheduler);
     });
 
     auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
@@ -901,8 +900,7 @@ BOOST_AUTO_TEST_CASE(test_sync_file_range)
                          sync_result).detach();
 
     std::thread runner([&scheduler]() {
-        BOOST_REQUIRE_EQUAL(scheduler.init(16), YYASIO_OK);
-        scheduler.run();
+        run_scheduler(scheduler);
     });
 
     auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
@@ -940,8 +938,7 @@ BOOST_AUTO_TEST_CASE(test_sync_file_range_badfd)
     sync_file_range_badfd_coro(&scheduler, sync_result).detach();
 
     std::thread runner([&scheduler]() {
-        BOOST_REQUIRE_EQUAL(scheduler.init(16), YYASIO_OK);
-        scheduler.run();
+        run_scheduler(scheduler);
     });
 
     auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
@@ -988,8 +985,7 @@ BOOST_AUTO_TEST_CASE(test_mutex_uncontended)
     BOOST_CHECK_EQUAL(mtx.waiter_count(), 0u);
 
     std::thread runner([&scheduler]() {
-        BOOST_REQUIRE_EQUAL(scheduler.init(16), YYASIO_OK);
-        scheduler.run();
+        run_scheduler(scheduler);
     });
 
     auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
@@ -1026,8 +1022,7 @@ BOOST_AUTO_TEST_CASE(test_mutex_fifo_order)
     BOOST_CHECK_EQUAL(mtx.waiter_count(), 3u);
 
     std::thread runner([&scheduler]() {
-        BOOST_REQUIRE_EQUAL(scheduler.init(16), YYASIO_OK);
-        scheduler.run();
+        run_scheduler(scheduler);
     });
 
     auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
@@ -1061,8 +1056,7 @@ BOOST_AUTO_TEST_CASE(test_mutex_try_lock)
     BOOST_CHECK(mtx.try_lock() == false); // must stay false, no stealing
 
     std::thread runner([&scheduler]() {
-        BOOST_REQUIRE_EQUAL(scheduler.init(16), YYASIO_OK);
-        scheduler.run();
+        run_scheduler(scheduler);
     });
 
     auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
@@ -1108,8 +1102,7 @@ BOOST_AUTO_TEST_CASE(test_mutex_lock_guard_scoped)
     BOOST_CHECK(mtx.try_lock() == false); // held inside the scope
 
     std::thread runner([&scheduler]() {
-        BOOST_REQUIRE_EQUAL(scheduler.init(16), YYASIO_OK);
-        scheduler.run();
+        run_scheduler(scheduler);
     });
 
     auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
@@ -1145,8 +1138,7 @@ BOOST_AUTO_TEST_CASE(test_mutex_lock_guard_fifo)
     BOOST_CHECK_EQUAL(mtx.waiter_count(), 3u);
 
     std::thread runner([&scheduler]() {
-        BOOST_REQUIRE_EQUAL(scheduler.init(16), YYASIO_OK);
-        scheduler.run();
+        run_scheduler(scheduler);
     });
 
     auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
@@ -1296,8 +1288,7 @@ BOOST_AUTO_TEST_CASE(test_task_move_only_result_async)
     take_int_ptr_after_io(&scheduler, out, done).detach();
 
     std::thread runner([&scheduler]() {
-        BOOST_REQUIRE_EQUAL(scheduler.init(16), YYASIO_OK);
-        scheduler.run();
+        run_scheduler(scheduler);
     });
 
     auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
@@ -1346,8 +1337,7 @@ BOOST_AUTO_TEST_CASE(test_task_move_only_token_ownership)
     take_token_after_io(&scheduler, base, held_owners, released_owners, done).detach();
 
     std::thread runner([&scheduler]() {
-        BOOST_REQUIRE_EQUAL(scheduler.init(16), YYASIO_OK);
-        scheduler.run();
+        run_scheduler(scheduler);
     });
 
     auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
@@ -1408,8 +1398,7 @@ BOOST_AUTO_TEST_CASE(test_task_move_only_forward_nested)
     take_forwarded_ptr_coro(&scheduler, out, inner_checked, done).detach();
 
     std::thread runner([&scheduler]() {
-        BOOST_REQUIRE_EQUAL(scheduler.init(16), YYASIO_OK);
-        scheduler.run();
+        run_scheduler(scheduler);
     });
 
     auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
@@ -1645,8 +1634,7 @@ BOOST_AUTO_TEST_CASE(test_event_move_only_across_scheduler_coroutines)
     publish_ptr_after_io(&scheduler, event, MOVE_ONLY_MAGIC, published).detach();
 
     std::thread runner([&scheduler]() {
-        BOOST_REQUIRE_EQUAL(scheduler.init(16), YYASIO_OK);
-        scheduler.run();
+        run_scheduler(scheduler);
     });
 
     auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
@@ -1658,6 +1646,272 @@ BOOST_AUTO_TEST_CASE(test_event_move_only_across_scheduler_coroutines)
     BOOST_CHECK_EQUAL(seen.load(), MOVE_ONLY_MAGIC);
     scheduler.stop();
     runner.join();
+}
+
+// ==================== TimeoutEvent / Scheduler::abandon() Tests ====================
+//
+// TimeoutEvent::wait_until() 会向 scheduler 提交一个 IORING_OP_TIMEOUT，并把它的
+// index 记在 _cancel_index 上。若协程是被 set() 提前唤醒的，set() 先 abandon 这个
+// index，保证那个定时器 CQE 迟到时既不会 resume 已经推进/销毁的协程，也不会再写
+// 它的结果槽。因此下面每个用例都在盯 times：一旦超过预期次数，就是发生了二次唤醒
+// （协程帧此时已被销毁，开了 ASan 会直接报 heap-use-after-free）。
+
+struct TimeoutWakeLog {
+    std::atomic<int> times{0};
+    std::atomic<long long> elapsed_ms[4]{};   // 每次唤醒距该轮 co_await 开始的毫秒数
+};
+
+static long long ms_since(std::chrono::steady_clock::time_point start)
+{
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
+               std::chrono::steady_clock::now() - start).count();
+}
+
+// 记录一次唤醒，返回它在 log 里的槽位
+static int record_wakeup(TimeoutWakeLog& log, std::chrono::steady_clock::time_point start)
+{
+    int slot = log.times.fetch_add(1);
+    if (slot < 4) log.elapsed_ms[slot].store(ms_since(start));
+    return slot;
+}
+
+// ---------- 1. 只有超时，没人 set ----------
+
+Task<void> wait_timeout_once(TimeoutEvent* ev, TimeoutWakeLog& log, std::atomic<bool>& done)
+{
+    auto start = std::chrono::steady_clock::now();
+    co_await ev->wait_until(std::chrono::milliseconds(1500));
+    record_wakeup(log, start);
+    done.store(true);
+}
+
+BOOST_AUTO_TEST_CASE(test_timeout_event_fires_on_timeout)
+{
+    Scheduler scheduler;
+    TimeoutEvent ev(&scheduler);
+    TimeoutWakeLog log;
+    std::atomic<bool> done{false};
+
+    // 沿用本文件的约定：detach() 在启动 runner 线程之前完成，
+    // 于是 timer SQE 先停在 pending_queue 里，init/run 与协程同线程。
+    wait_timeout_once(&ev, log, done).detach();
+
+    std::thread runner([&scheduler]() {
+        run_scheduler(scheduler);
+    });
+
+    auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (!done.load() && std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+
+    BOOST_CHECK(done.load());
+    BOOST_CHECK_EQUAL(log.times.load(), 1);
+    // 1500ms 的亚秒部分不能丢：若只保留 tv_sec 会退化成整 1s 就触发
+    BOOST_CHECK_GE(log.elapsed_ms[0].load(), 1400);
+    BOOST_CHECK_LE(log.elapsed_ms[0].load(), 3000);
+
+    scheduler.stop();
+    runner.join();
+}
+
+// ---------- 2. set() 抢先，未到期定时器被 abandon ----------
+
+Task<void> wait_until_set_arrives(TimeoutEvent* ev, TimeoutWakeLog& log, std::atomic<bool>& done)
+{
+    auto start = std::chrono::steady_clock::now();
+    co_await ev->wait_until(std::chrono::milliseconds(1200));
+    record_wakeup(log, start);
+    done.store(true);
+}
+
+Task<void> set_after_50ms(Scheduler* scheduler, TimeoutEvent* ev)
+{
+    struct __kernel_timespec ts = { .tv_sec = 0, .tv_nsec = 50'000'000 };
+    co_await timeout(scheduler, &ts);
+    ev->set();
+}
+
+BOOST_AUTO_TEST_CASE(test_timeout_event_set_wins_and_timer_is_abandoned)
+{
+    Scheduler scheduler;
+    TimeoutEvent ev(&scheduler);
+    TimeoutWakeLog log;
+    std::atomic<bool> done{false};
+
+    // 两个协程都在 run() 之前挂起：waiter 已登记 _coro，setter 的 50ms 定时器与
+    // waiter 的 1200ms 定时器一起进 pending_queue，时序确定、没有竞态。
+    wait_until_set_arrives(&ev, log, done).detach();
+    set_after_50ms(&scheduler, &ev).detach();
+
+    std::thread runner([&scheduler]() {
+        run_scheduler(scheduler);
+    });
+
+    auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (!done.load() && std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+
+    BOOST_CHECK(done.load());
+    BOOST_CHECK_EQUAL(log.times.load(), 1);
+    BOOST_CHECK_GE(log.elapsed_ms[0].load(), 30);   // 不是秒级抖动
+    BOOST_CHECK_LE(log.elapsed_ms[0].load(), 800);  // 远早于 1200ms，是被 set 唤醒的
+
+    // 跨过原来的超时期限，确认迟到的定时器 CQE 没有第二次唤醒协程
+    std::this_thread::sleep_for(std::chrono::milliseconds(1200));
+    BOOST_CHECK_EQUAL(log.times.load(), 1);
+
+    scheduler.stop();
+    runner.join();
+    BOOST_CHECK_EQUAL(log.times.load(), 1);
+}
+
+// ---------- 3. 同一 event 复用：超时路径 ----------
+
+Task<void> wait_timeout_three_times(TimeoutEvent* ev, TimeoutWakeLog& log, std::atomic<bool>& done)
+{
+    for (int i = 0; i < 3; ++i)
+    {
+        auto start = std::chrono::steady_clock::now();
+        co_await ev->wait_until(std::chrono::milliseconds(30));
+        record_wakeup(log, start);
+    }
+    done.store(true);
+}
+
+BOOST_AUTO_TEST_CASE(test_timeout_event_reusable_after_timeout)
+{
+    // 回归用例：正常超时路径以前不复位 _cancel_index，第二次 co_await 会撞在
+    // await_suspend 的 assert(_cancel_index == max) 上直接 abort。
+    Scheduler scheduler;
+    TimeoutEvent ev(&scheduler);
+    TimeoutWakeLog log;
+    std::atomic<bool> done{false};
+
+    wait_timeout_three_times(&ev, log, done).detach();
+
+    std::thread runner([&scheduler]() {
+        run_scheduler(scheduler);
+    });
+
+    auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (!done.load() && std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+
+    BOOST_CHECK(done.load());
+    BOOST_CHECK_EQUAL(log.times.load(), 3);
+    for (int i = 0; i < 3; ++i) {
+        BOOST_CHECK_GE(log.elapsed_ms[i].load(), 20);   // 每轮都真的等满了
+        BOOST_CHECK_LE(log.elapsed_ms[i].load(), 1000);
+    }
+
+    scheduler.stop();
+    runner.join();
+}
+
+// ---------- 4. 同一 event 复用：abandon 之后还能重新武装 ----------
+
+Task<void> wait_two_rounds_after_set(TimeoutEvent* ev, TimeoutWakeLog& log, std::atomic<bool>& done)
+{
+    // 第 1 轮：1000ms 定时器，会被 set() 提前打断并 abandon
+    auto t0 = std::chrono::steady_clock::now();
+    co_await ev->wait_until(std::chrono::milliseconds(1000));
+    record_wakeup(log, t0);
+
+    // 第 2 轮：上一轮的 cancel 不能影响这一轮，正常靠超时唤醒
+    auto t1 = std::chrono::steady_clock::now();
+    co_await ev->wait_until(std::chrono::milliseconds(40));
+    record_wakeup(log, t1);
+
+    done.store(true);
+}
+
+BOOST_AUTO_TEST_CASE(test_timeout_event_rearmable_after_abandon)
+{
+    Scheduler scheduler;
+    TimeoutEvent ev(&scheduler);
+    TimeoutWakeLog log;
+    std::atomic<bool> done{false};
+
+    wait_two_rounds_after_set(&ev, log, done).detach();
+    set_after_50ms(&scheduler, &ev).detach();
+
+    std::thread runner([&scheduler]() {
+        run_scheduler(scheduler);
+    });
+
+    auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (!done.load() && std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+
+    BOOST_CHECK(done.load());
+    BOOST_CHECK_EQUAL(log.times.load(), 2);
+    BOOST_CHECK_LE(log.elapsed_ms[0].load(), 800);   // 第 1 轮由 set 提前唤醒
+    BOOST_CHECK_LE(log.elapsed_ms[1].load(), 1000);  // 第 2 轮由自己的超时唤醒
+
+    // 等过第 1 轮那个 1000ms 定时器的原始期限，确认它没有再来一次
+    std::this_thread::sleep_for(std::chrono::milliseconds(300));
+    BOOST_CHECK_EQUAL(log.times.load(), 2);
+
+    scheduler.stop();
+    runner.join();
+}
+
+// ---------- 5. Scheduler 层：abandon 命中尚未提交的 pending item ----------
+
+BOOST_AUTO_TEST_CASE(test_abandon_drops_pending_item_and_caller_resumes)
+{
+    Scheduler scheduler;
+    TimeoutEvent ev(&scheduler);
+    TimeoutWakeLog log;
+    std::atomic<bool> done{false};
+
+    // 注意此时还没有 init()/run()：协程挂起后它的 timer SQE 只停在 pending_queue 里，
+    // 于是 abandon() 走的是 pending 分支（丢弃 SQE、不发 cancel），resume 由调用方负责。
+    wait_until_set_arrives(&ev, log, done).detach();
+    BOOST_REQUIRE(!done.load());
+
+    ev.set();
+    BOOST_CHECK_EQUAL(log.times.load(), 1);
+    BOOST_CHECK(done.load());   // 协程被调用方 resume 后一路跑到销毁
+
+    // 现在才把循环启动起来：那个被丢弃的 item 不该被提交，也不该有任何 CQE 二次唤醒
+    std::thread runner([&scheduler]() {
+        run_scheduler(scheduler);
+    });
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(300));
+    BOOST_CHECK_EQUAL(log.times.load(), 1);
+
+    scheduler.stop();
+    runner.join();
+    BOOST_CHECK_EQUAL(log.times.load(), 1);
+}
+
+// ---------- 6. Scheduler 层：abandon 未知 index 是 no-op ----------
+
+BOOST_AUTO_TEST_CASE(test_abandon_unknown_index_is_noop)
+{
+    Scheduler scheduler;
+
+    // TimeoutEvent 用 ULLONG_MAX 当「没有定时器」的哨兵，set() 会在哨兵状态下也调
+    // abandon；从未 schedule 过的 index 同样不该有任何副作用（幂等）。
+    scheduler.abandon(std::numeric_limits<uint64_t>::max());
+    scheduler.abandon(12345);
+    scheduler.abandon(0);
+
+    // 队列/在飞表都是空的，循环靠 idle timeout 兜底，应能干净启停
+    std::thread runner([&scheduler]() {
+        run_scheduler(scheduler);
+    });
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    scheduler.stop();
+    runner.join();
+
+    BOOST_CHECK(true);
 }
 
 BOOST_AUTO_TEST_SUITE_END()

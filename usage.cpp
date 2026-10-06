@@ -427,6 +427,58 @@ yyasio::Task<void> lock_guard_demo(yyasio::Scheduler* scheduler)
     std::cout << "lock_guard_demo: final counter = " << counter << " (expected 2)\n";
 }
 
+// Demo of TimeoutEvent: 一个可等待的定时器，「超时」和「被 set 唤醒」谁先到都行。
+yyasio::Task<void> timeout_event_worker(yyasio::Scheduler* scheduler, yyasio::TimeoutEvent& ev,
+                                        std::atomic<int>& rounds)
+{
+    constexpr auto kTimeout = std::chrono::milliseconds(500);
+    for (int i = 0; i < 4; ++i)
+    {
+        auto start = std::chrono::steady_clock::now();
+        std::cout << "timeout_event demo: round " << i << ", waiting up to 500ms\n";
+        co_await ev.wait_until(kTimeout);
+        auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+                           std::chrono::steady_clock::now() - start).count();
+        // 没到 500ms 就是被 set() 提前叫起的（那一轮的定时器已被 abandon）
+        std::cout << "timeout_event demo: round " << i << " woke after " << elapsed
+                  << " ms (" << (elapsed < 500 ? "set() won" : "timeout won") << ")\n";
+        rounds.fetch_add(1);
+    }
+    std::cout << "timeout_event demo: worker done\n";
+}
+
+// 每 200ms set 一次，共 3 次；worker 的最后一轮（第 4 轮）没人 set，走自然超时。
+// 单线程调度下 worker 被唤醒后会在同一条调用链里重新 co_await，所以每次 set 都能
+// 命中一个已经挂好的 waiter，时序是确定的。
+yyasio::Task<void> timeout_event_setter(yyasio::Scheduler* scheduler, yyasio::TimeoutEvent& ev)
+{
+    for (int i = 0; i < 3; ++i)
+    {
+        struct __kernel_timespec ts = { .tv_sec = 0, .tv_nsec = 200'000'000 }; // 200ms
+        co_await yyasio::timeout(scheduler, &ts);
+        std::cout << "timeout_event demo: calling set() #" << i << "\n";
+        ev.set();
+    }
+}
+
+yyasio::Task<void> timeout_event_demo(yyasio::Scheduler* scheduler)
+{
+    yyasio::TimeoutEvent ev(scheduler);
+    std::atomic<int> rounds{0};
+
+    timeout_event_worker(scheduler, ev, rounds).detach();
+    timeout_event_setter(scheduler, ev).detach();
+
+    // ev 活在本协程帧里，必须等两个 detached 协程都结束才能销毁，
+    // 否则它们持有的 TimeoutEvent 引用/正在飞的定时器 CQE 会落在已释放的帧上。
+    struct __kernel_timespec ts = { .tv_sec = 0, .tv_nsec = 100'000'000 }; // 100ms
+    while (rounds.load() < 4)
+    {
+        co_await yyasio::timeout(scheduler, &ts);
+    }
+    std::cout << "timeout_event_demo: final rounds = " << rounds.load() << " (expected 4)\n";
+}
+
 int main()
 {
     yyasio::Scheduler scheduler;
@@ -463,6 +515,12 @@ int main()
 
     is_finished_demo(&scheduler).detach();
 
+    timeout_event_demo(&scheduler).detach();
+
     // will block here
     scheduler.run();
+
+    // run() only returns on a fatal submit error (or if stop() was requested), and it
+    // must be paired with shutdown() on this very thread to release the ring.
+    scheduler.shutdown();
 }

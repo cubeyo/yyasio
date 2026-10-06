@@ -1,6 +1,8 @@
 #pragma once
 
 #include <cassert>
+#include <chrono>
+#include <limits>
 #include <cstdint>
 #include <cstring>
 #include <ctime>
@@ -9,6 +11,7 @@
 #include <functional>
 #include <queue>
 #include <memory>
+#include <set>
 #include <sys/socket.h>
 #include <concepts>
 #include <unordered_map>
@@ -235,7 +238,12 @@ constexpr const char* _filename_only(const char* path) {
                   << " [Coro] " << hint << std::hex << coro.address() << std::dec << "(" << reinterpret_cast<uint64_t>(coro.address()) << ")\n"; \
     } while(0)
 #else
-#define debug_coro(hint, coro) do {} while(0)
+// Both arguments stay name-checked even when logging is compiled out:
+// sizeof(decltype(...)) is not evaluated, so there is no runtime cost, but a call
+// site referencing a renamed or not-yet-declared variable still breaks the build
+// here instead of only when PRINT_CORO_RUNTIMEINFO gets turned on.
+#define debug_coro(hint, coro) \
+    do { (void)sizeof(decltype(hint)); (void)sizeof(decltype(coro)); } while(0)
 #endif
 
 namespace yyasio
@@ -293,6 +301,12 @@ public:
             _pending = true;
         }
     }
+
+    Event() = default;
+    Event(const Event& other) = delete;
+    Event& operator=(const Event&) = delete;
+    Event(Event&& other) = delete;
+    Event& operator=(Event&& other) = delete;
 private:
     std::coroutine_handle<> _coro {};
     T _value {};
@@ -321,7 +335,7 @@ struct Mutex
         void await_resume() const noexcept { }
         Mutex* _mtx;
     };
-    
+
     struct LockGuard
     {
         LockGuard(Mutex& mtx): _mtx(mtx) {}
@@ -356,6 +370,13 @@ struct Mutex
         }
         Mutex* _mtx;
     };
+
+    Mutex() = default;
+
+    Mutex(const Mutex& other) = delete;
+    Mutex& operator=(const Mutex&) = delete;
+    Mutex(Mutex&& other) = delete;
+    Mutex& operator=(Mutex&& other) = delete;
 
     AwaiterWithGuard lock_guard() { return AwaiterWithGuard(this); }
     Awaiter lock() { return Awaiter(this); }
@@ -485,7 +506,7 @@ struct Task
 
             std::terminate();
         }
-        
+
         ~promise_type()
         {
             *_done_guard = true;
@@ -529,6 +550,7 @@ struct Task
 
     void detach()
     {
+        assert(_callee);
         _callee.resume();
         _callee = nullptr;
     }
@@ -545,6 +567,7 @@ struct Task
 
     // to support co_await on Task
     auto operator co_await() const noexcept {
+        assert(_callee);
         struct Awaiter {
             std::coroutine_handle<promise_type> _callee;
             Awaiter(std::coroutine_handle<promise_type> callee) : _callee(callee) {}
@@ -586,21 +609,65 @@ class Scheduler
 {
 public:
     ErrorCode init(size_t entries) {
+        if (initialized)
+            return YYASIO_INIT_ERROR;
+
         // These two flags are supported by kernel >= 6.0
         if (io_uring_queue_init(entries, &ring, IORING_SETUP_SINGLE_ISSUER|IORING_SETUP_DEFER_TASKRUN) < 0 &&
             io_uring_queue_init(entries, &ring, 0) < 0)
         {
             return YYASIO_INIT_ERROR;
         }
+
+        initialized = true;
         return YYASIO_OK;
     }
 
-    void schedule(std::coroutine_handle<> coro, PrepSqeClosure prep_seq_fn, int* presult)
+    // this function should be called in same thread which calls run()
+    void shutdown() {
+        if (initialized)
+        {
+            io_uring_queue_exit(&ring);
+            // Clear the flag: a second io_uring_queue_exit() would unregister and
+            // munmap using the stale ring pointers, so allow at most one per init().
+            initialized = false;
+        }
+    }
+
+    uint64_t schedule(std::coroutine_handle<> coro, PrepSqeClosure prep_seq_fn, int* presult)
     {
-        struct timespec enter_ts {};
-        clock_gettime(CLOCK_MONOTONIC, &enter_ts);
         debug_coro("schedule coro:", coro);
-        pending_queue.push(std::make_tuple(coro, prep_seq_fn, presult, enter_ts));
+        return append_pending_queue(coro, prep_seq_fn, presult);
+    }
+
+    // Calling abandon means the caller does not care about the io result and will 
+    // take responsibility for resuming the coroutine. Thus, the scheduler will ignore
+    // cqe for this io and will NOT call resume for the coroutine which is suspended
+    // by inflight io.
+    // abandon must be called inside some coroutine
+    // (from hardware thread which calls scheduler.run())
+    void abandon(uint64_t index)
+    {
+        bool io_is_pending = !pending_queue.empty() && index >= pending_queue.front().index && index <= pending_queue.back().index;
+        bool io_is_inflight = inflight_map.contains(index);
+        if (!io_is_pending && !io_is_inflight)
+        {
+            return;
+        }
+
+        if (io_is_inflight)
+        {
+            // submit a pending item into pending queue, set the coro address to nullptr
+            // which the scheduler will not resume anything when cqe is peeked
+            auto prep_cancel_fn = [index](io_uring_sqe* sqe) -> void {
+                io_uring_prep_cancel64(sqe, index, 0);
+            };
+
+            // not care about result
+            append_pending_queue(nullptr, prep_cancel_fn, nullptr);
+        }
+
+        abandoned.insert(index);
     }
 
     // Request the loop to return. stop() may be called from another thread (that is
@@ -611,10 +678,19 @@ public:
     // runs it may touch it.
     void stop() { stopped.store(true, std::memory_order_release); }
 
+public:
     void run()
     {
+        // Until init() succeeded the ring is zero-initialized, so every liburing call
+        // below would dereference NULL ring pages and crash. Refuse to start instead.
+        if (!initialized) [[unlikely]]
+        {
+            std::cerr << "Scheduler::run() called without a successful init()\n";
+            return;
+        }
+
         constexpr uint64_t MAGIC_IDLE_TIMEOUT = 0xFFFFFFFFFFFFFF00ULL;
-        constexpr struct __kernel_timespec idle_ts {0, 1000};
+        constexpr struct __kernel_timespec idle_ts {0, 1000000};
         while (!stopped.load(std::memory_order_acquire))
         {
             batch_prepare_sqe();
@@ -636,12 +712,20 @@ public:
                 }
             }
 
-            int submitted = io_uring_submit_and_wait(&ring, 1);
-            if (submitted < 0) [[unlikely]]
-            {
-                std::cerr << "io_uring_submit_and_wait failed:, ret = " << submitted << "\n";
-                return;
-            }
+            int submitted = 0;
+            do {
+                submitted = io_uring_submit_and_wait(&ring, 1);
+                if (submitted < 0) [[unlikely]]
+                {
+                    if (submitted == -EINTR || submitted == -EAGAIN)
+                    {
+                        continue;
+                    }
+                    std::cerr << "io_uring_submit_and_wait failed:, ret = " << submitted << "\n";
+                    return;
+                }
+                break;
+            } while (true);
 
             tot_submit_items += submitted;
             tot_submit_count += 1;
@@ -669,8 +753,20 @@ public:
                 }
 
                 auto [coro_addr, res_addr] = iter->second;
-                auto handle = std::coroutine_handle<>::from_address(reinterpret_cast<void*>(coro_addr));
+                uint64_t index = iter->first;
                 inflight_map.erase(iter);
+                if (check_abandoned_and_erase(index))
+                {
+                    continue;
+                }
+                // empty coroutine address means this IO is emitted by
+                // scheduler itself, no coroutine need to be continued
+                if (!coro_addr)
+                {
+                    continue;
+                }
+
+                auto handle = std::coroutine_handle<>::from_address(reinterpret_cast<void*>(coro_addr));
                 debug_coro("io returned:", handle);
                 if (res_addr) [[likely]]
                 {
@@ -686,13 +782,15 @@ public:
     {
         std::cout << "Total schedule time: " << tot_sched_time << " ns\n";
         std::cout << "Total schedule count: " << tot_sched_count << "\n";
-        std::cout << "Average schedule time: " << tot_sched_time / tot_sched_count << " ns\n";
+        if (tot_sched_count > 0)
+            std::cout << "Average schedule time: " << tot_sched_time / tot_sched_count << " ns\n";
         std::cout << "Total submit items: " << tot_submit_items << "\n";
         std::cout << "Total submit count: " << tot_submit_count << "\n";
-        std::cout << "Average submit items per submit: " << tot_submit_items / tot_submit_count << "\n";
-        std::cout << "Average pending queue size: " << tot_pending_queue_size / tot_pending_queue_sample_count << "\n";
+        if (tot_submit_count > 0)
+            std::cout << "Average submit items per submit: " << tot_submit_items / tot_submit_count << "\n";
+        if (tot_pending_queue_sample_count > 0)
+            std::cout << "Average pending queue size: " << tot_pending_queue_size / tot_pending_queue_sample_count << "\n";
     }
-
 
 private:
     void batch_prepare_sqe()
@@ -702,6 +800,13 @@ private:
 
         while (!pending_queue.empty())
         {
+            const auto& item = pending_queue.front();
+            if (check_abandoned_and_erase(item.index))
+            {
+                pending_queue.pop();
+                continue;
+            }
+
             auto* sqe = io_uring_get_sqe(&ring);
             if (!sqe)
             {
@@ -712,29 +817,63 @@ private:
                           << ", ktail=" << *ring.sq.ktail << "\n";
                 break;
             }
-            auto [coro, prep_sqe_fn, res_addr, enter_ts] = pending_queue.front();
 
             struct timespec sched_ts {};
             clock_gettime(CLOCK_MONOTONIC, &sched_ts);
             uint64_t cost_ns = (static_cast<uint64_t>(sched_ts.tv_sec) * 1000000000ULL + sched_ts.tv_nsec) -
-                               (static_cast<uint64_t>(enter_ts.tv_sec) * 1000000000ULL + enter_ts.tv_nsec);
+                               (static_cast<uint64_t>(item.enter_ts.tv_sec) * 1000000000ULL + item.enter_ts.tv_nsec);
             tot_sched_time += cost_ns;
             tot_sched_count++;
 
-            debug_coro("prepare sqe for coro:", coro);
+            debug_coro("prepare sqe for coro:", item.coro);
             memset(sqe, 0, sizeof(*sqe)); // ensure SQE is clean before prep
-            prep_sqe_fn(sqe);
-            inflight_map[io_cnt] = std::make_tuple(coro.address(), res_addr);
-            io_uring_sqe_set_data64(sqe, io_cnt);
-            io_cnt++;
+            item.prep_sqe_fn(sqe);
+            inflight_map.emplace(item.index, InflightItem {
+                item.coro.address(), item.res_addr
+            });
+            io_uring_sqe_set_data64(sqe, item.index);
             pending_queue.pop();
         }
     }
 
+    std::uint64_t append_pending_queue(std::coroutine_handle<> coro, PrepSqeClosure prep_sqe_fn, int* res_addr)
+    {
+        struct timespec enter_ts {};
+        clock_gettime(CLOCK_MONOTONIC, &enter_ts);
+        uint64_t index = last_index++;
+        pending_queue.emplace(coro, std::move(prep_sqe_fn), res_addr, enter_ts, index);
+        return index;
+    }
+
+    // return true if the index is canceled
+    bool check_abandoned_and_erase(uint64_t index)
+    {
+        auto iter = abandoned.find(index);
+        bool ret = iter != abandoned.end();
+        if (ret)
+            abandoned.erase(iter);
+        return ret;
+    }
+
     io_uring ring {};
-    std::queue<std::tuple<std::coroutine_handle<>, PrepSqeClosure, int*, struct timespec>> pending_queue;
-    uint64_t io_cnt = 0;
-    std::unordered_map<uint64_t, std::tuple<void*, int*>> inflight_map; // io_idx -> <coro addr, result addr>
+    struct PendingItem {
+        std::coroutine_handle<> coro;
+        PrepSqeClosure prep_sqe_fn;
+        int* res_addr;
+        struct timespec enter_ts;
+        uint64_t index;
+    };
+
+    std::queue<PendingItem> pending_queue;
+    uint64_t last_index = 0;
+    std::set<uint64_t> abandoned;
+
+    struct InflightItem
+    {
+        void* coro_address;
+        int* result_addr;
+    };
+    std::unordered_map<uint64_t, InflightItem> inflight_map; // io_idx -> <coro addr, result addr>
 
     std::atomic<bool> stopped{false};
     uint64_t tot_sched_time = 0;
@@ -743,6 +882,81 @@ private:
     uint64_t tot_submit_count = 0;
     uint64_t tot_pending_queue_size = 0;
     uint64_t tot_pending_queue_sample_count = 0;
+    bool initialized = false;
+};
+
+class TimeoutEvent
+{
+public:
+    struct Awaiter
+    {
+        Awaiter(Scheduler* scheduler, struct __kernel_timespec* time_spec, TimeoutEvent* event):
+            _scheduler(scheduler), _time_spec(time_spec), _event(event) {}
+
+        bool await_ready() const noexcept {
+            // if has pending value, return true to skip suspend coroutine
+            // else, return false to suspend coroutine
+            return _event->_pending;
+        }
+
+        bool await_suspend(std::coroutine_handle<> coro) noexcept {
+            assert (!_event->_coro);
+            _event->_coro = coro;
+            PrepSqeClosure prepare_sqe_cb = [ts = _time_spec](io_uring_sqe* sqe) -> void {
+                io_uring_prep_timeout(sqe, ts, 0, 0);
+            };
+            assert (_event->_cancel_index == std::numeric_limits<uint64_t>::max());
+            _event->_cancel_index = _scheduler->schedule(coro, prepare_sqe_cb, nullptr);
+            return true;
+        }
+
+        void await_resume() const
+        {
+            _event->_cancel_index = std::numeric_limits<uint64_t>::max();
+            _event->_coro = nullptr;
+            _event->_pending = false;
+        }
+
+        Scheduler* _scheduler;
+        struct __kernel_timespec* _time_spec;
+        TimeoutEvent* _event;
+    };
+
+public:
+    explicit TimeoutEvent(Scheduler* scheduler): _scheduler(scheduler) {}
+    TimeoutEvent(const TimeoutEvent& other) = delete;
+    TimeoutEvent& operator=(const TimeoutEvent&) = delete;
+    TimeoutEvent(TimeoutEvent&& other) = delete;
+    TimeoutEvent& operator=(TimeoutEvent&& other) = delete;
+
+    template<typename Rep, typename Period>
+    Awaiter wait_until(std::chrono::duration<Rep, Period> duration) {
+        auto secs = std::chrono::duration_cast<std::chrono::seconds>(duration);
+        auto nsecs = std::chrono::duration_cast<std::chrono::nanoseconds>(duration - secs);
+        _timespec.tv_sec = secs.count();
+        _timespec.tv_nsec = nsecs.count();
+        return {_scheduler, &_timespec, this};
+    }
+
+    void set()
+    {
+        if (_coro)
+        {
+            _scheduler->abandon(_cancel_index);
+            _coro.resume();
+        }
+        else
+        {
+            _pending = true;
+        }
+    }
+
+private:
+    std::coroutine_handle<> _coro;
+    bool _pending = false;
+    uint64_t _cancel_index = std::numeric_limits<uint64_t>::max();
+    Scheduler* _scheduler;
+    struct __kernel_timespec _timespec {};
 };
 
 struct UringAwaiter
@@ -751,12 +965,12 @@ public:
     explicit UringAwaiter(Scheduler* scheduler, PrepSqeClosure prepare_sqe_fn)
         : scheduler(scheduler), _prepare_sqe_fn(prepare_sqe_fn) {}
     
-    // UringAwaiter(const UringAwaiter&) = delete;
-    // UringAwaiter& operator=(const UringAwaiter&) = delete;
-    // UringAwaiter(UringAwaiter&&) = delete;
-    // UringAwaiter& operator=(UringAwaiter&&) = delete;
+    UringAwaiter(const UringAwaiter&) = delete;
+    UringAwaiter& operator=(const UringAwaiter&) = delete;
+    UringAwaiter(UringAwaiter&&) = delete;
+    UringAwaiter& operator=(UringAwaiter&&) = delete;
 
-    virtual ~UringAwaiter()
+    ~UringAwaiter()
     {
         debug_coro("awaiter destroyed by coro:", coro_handle);
     }
