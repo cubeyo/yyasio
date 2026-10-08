@@ -1107,6 +1107,160 @@ BOOST_AUTO_TEST_CASE(test_unlinkat_nonempty_directory)
     runner.join();
 }
 
+// ==================== Statx Test ====================
+
+static const char* TEST_STATX_DIR_PATH     = "/tmp/yyasio_test_statx_dir";
+static const char* TEST_STATX_FILE_NAME    = "file.txt";
+static const char* TEST_STATX_FILE_PATH    = "/tmp/yyasio_test_statx_dir/file.txt";
+static const char* TEST_STATX_LINK_PATH    = "/tmp/yyasio_test_statx_dir/link.txt";
+static const char* TEST_STATX_MISSING_PATH = "/tmp/yyasio_statx_nonexistent_xyz.txt";
+
+static void cleanup_statx_test_paths()
+{
+    unlink(TEST_STATX_LINK_PATH);
+    unlink(TEST_STATX_FILE_PATH);
+    rmdir(TEST_STATX_DIR_PATH);
+}
+
+// Buffers and return codes of one async run. The loop thread writes every field and
+// the test thread only reads them once last_ret has published those writes, which is
+// the same handoff the read() cases already rely on for their buffers.
+struct StatxProbe
+{
+    struct statx absolute {};
+    struct statx relative {};
+    struct statx followed {};
+    struct statx not_followed {};
+    int absolute_ret = -1;
+    int relative_ret = -1;
+    int bogus_dirfd_ret = -1;
+    int follow_ret = -1;
+    int nofollow_ret = -1;
+    int missing_ret = -1;
+};
+
+// Async answer must match what the synchronous syscall reports for the same arguments.
+static void check_statx_like_sync(const struct statx& got, const struct statx& ref)
+{
+    BOOST_CHECK_EQUAL(got.stx_mask, ref.stx_mask);
+    BOOST_CHECK_EQUAL(got.stx_mode, ref.stx_mode);
+    BOOST_CHECK_EQUAL(got.stx_nlink, ref.stx_nlink);
+    BOOST_CHECK_EQUAL(got.stx_ino, ref.stx_ino);
+    BOOST_CHECK_EQUAL(got.stx_uid, ref.stx_uid);
+    BOOST_CHECK_EQUAL(got.stx_gid, ref.stx_gid);
+    BOOST_CHECK_EQUAL(got.stx_size, ref.stx_size);
+    BOOST_CHECK_EQUAL(got.stx_attributes, ref.stx_attributes);
+}
+
+// Six requests in one coroutine: the file by absolute path, the same file through a
+// dirfd with a relative name, that relative name again with a bogus dirfd, a symlink
+// followed and not followed, and a path that does not exist.
+//
+// The arguments are covered by comparing each async answer with a synchronous call
+// made using the same ones, which is what catches a dropped parameter: measured with
+// this case, passing 0 instead of flags loses the symlink check, AT_FDCWD instead of
+// dfd loses the relative name, and 0 instead of the mask shows up as stx_mask
+// 0x173f instead of 0x17ff. No case pins a *narrow* mask though -- statx(2) backfills
+// the basic set here whatever subset you ask for, so stx_mask cannot tell STATX_SIZE
+// from a hardcoded default.
+Task<void> statx_coro(Scheduler* scheduler, int dir_fd, StatxProbe& probe, std::atomic<int>& last_ret)
+{
+    probe.absolute_ret = co_await statx(scheduler, AT_FDCWD, TEST_STATX_FILE_PATH, &probe.absolute);
+    probe.relative_ret = co_await statx(scheduler, dir_fd, TEST_STATX_FILE_NAME, &probe.relative);
+
+    struct statx unused {};
+    // -EBADF only if the dfd really comes from the SQE: a wrapper that ignored it and
+    // fell back to AT_FDCWD would answer -ENOENT instead (no ./file.txt in the CWD).
+    probe.bogus_dirfd_ret = co_await statx(scheduler, -1, TEST_STATX_FILE_NAME, &unused);
+
+    probe.follow_ret = co_await statx(scheduler, AT_FDCWD, TEST_STATX_LINK_PATH, &probe.followed);
+    probe.nofollow_ret = co_await statx(scheduler, AT_FDCWD, TEST_STATX_LINK_PATH, &probe.not_followed,
+                                       AT_SYMLINK_NOFOLLOW);
+
+    struct statx ghost {};
+    // io_uring reports failures as -errno, where the libc wrapper returns -1 + errno
+    probe.missing_ret = co_await statx(scheduler, AT_FDCWD, TEST_STATX_MISSING_PATH, &ghost);
+
+    std::cout << "statx_coro: absolute = " << probe.absolute_ret
+              << ", relative = " << probe.relative_ret
+              << ", bogus_dirfd = " << probe.bogus_dirfd_ret
+              << ", follow = " << probe.follow_ret
+              << ", nofollow = " << probe.nofollow_ret
+              << ", missing = " << probe.missing_ret << "\n";
+    last_ret.store(probe.missing_ret, std::memory_order_release);
+}
+
+BOOST_AUTO_TEST_CASE(test_statx)
+{
+    cleanup_statx_test_paths();
+    BOOST_REQUIRE_EQUAL(::mkdir(TEST_STATX_DIR_PATH, 0755), 0);
+
+    int fd = ::open(TEST_STATX_FILE_PATH, O_RDWR | O_CREAT | O_TRUNC, 0644);
+    BOOST_REQUIRE(fd > 0);
+    BOOST_CHECK_EQUAL(::write(fd, TEST_CONTENT, strlen(TEST_CONTENT)), (long)strlen(TEST_CONTENT));
+    BOOST_REQUIRE_EQUAL(::close(fd), 0);
+    BOOST_REQUIRE_EQUAL(::symlink(TEST_STATX_FILE_PATH, TEST_STATX_LINK_PATH), 0);
+
+    int dir_fd = ::open(TEST_STATX_DIR_PATH, O_RDONLY | O_DIRECTORY);
+    BOOST_REQUIRE(dir_fd > 0);
+
+    // Reference answers, taken while nothing else runs
+    struct statx ref_absolute {};
+    struct statx ref_relative {};
+    struct statx ref_followed {};
+    struct statx ref_not_followed {};
+    BOOST_REQUIRE_EQUAL(::statx(AT_FDCWD, TEST_STATX_FILE_PATH, 0, STATX_BASIC_STATS, &ref_absolute), 0);
+    BOOST_REQUIRE_EQUAL(::statx(dir_fd, TEST_STATX_FILE_NAME, 0, STATX_BASIC_STATS, &ref_relative), 0);
+    BOOST_REQUIRE_EQUAL(::statx(AT_FDCWD, TEST_STATX_LINK_PATH, 0, STATX_BASIC_STATS, &ref_followed), 0);
+    BOOST_REQUIRE_EQUAL(::statx(AT_FDCWD, TEST_STATX_LINK_PATH, AT_SYMLINK_NOFOLLOW,
+                                STATX_BASIC_STATS, &ref_not_followed), 0);
+
+    Scheduler scheduler;
+
+    StatxProbe probe;
+    std::atomic<int> last_ret{-1};
+    statx_coro(&scheduler, dir_fd, probe, last_ret).detach();
+
+    std::thread runner([&scheduler]() {
+        run_scheduler(scheduler);
+    });
+
+    auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (last_ret.load(std::memory_order_acquire) == -1 && std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+
+    // the error path doubles as the completion signal
+    BOOST_CHECK_EQUAL(last_ret.load(), -ENOENT);
+    BOOST_CHECK_EQUAL(probe.absolute_ret, 0);
+    BOOST_CHECK_EQUAL(probe.relative_ret, 0);
+    BOOST_CHECK_EQUAL(probe.bogus_dirfd_ret, -EBADF);
+    BOOST_CHECK_EQUAL(probe.follow_ret, 0);
+    BOOST_CHECK_EQUAL(probe.nofollow_ret, 0);
+
+    // each async answer equals the synchronous one taken with the same arguments
+    check_statx_like_sync(probe.absolute, ref_absolute);
+    check_statx_like_sync(probe.relative, ref_relative);
+    check_statx_like_sync(probe.followed, ref_followed);
+    check_statx_like_sync(probe.not_followed, ref_not_followed);
+
+    // and the values are the file written above, not whatever the buffer held
+    BOOST_CHECK(S_ISREG(probe.absolute.stx_mode));
+    BOOST_CHECK_EQUAL(probe.absolute.stx_size, (unsigned long long)strlen(TEST_CONTENT));
+    BOOST_CHECK_EQUAL(probe.absolute.stx_nlink, 1);
+
+    // the only argument whose effect is directly observable: which inode we got
+    BOOST_CHECK(S_ISREG(probe.followed.stx_mode));
+    BOOST_CHECK(S_ISLNK(probe.not_followed.stx_mode));
+    BOOST_CHECK_EQUAL(probe.not_followed.stx_size,
+                      (unsigned long long)strlen(TEST_STATX_FILE_PATH));
+
+    BOOST_REQUIRE_EQUAL(::close(dir_fd), 0);
+    cleanup_statx_test_paths();
+    scheduler.stop();
+    runner.join();
+}
+
 // ==================== SyncFileRange Test ====================
 
 static const char* TEST_SYNC_FILE_PATH = "/tmp/yyasio_test_sync_range.txt";

@@ -7,7 +7,7 @@
 ## 特性
 
 - **Header-only**：单个头文件 `yyasio.h`，拷贝即用。
-- **io_uring 封装**：`read` / `write` / `sync_file_range` / `openat` / `close` / `accept` / `connect` / `listen` / `timeout` / `renameat` / `unlinkat` / `mkdirat` / `cancel_fd` 等常用操作的异步 awaiter。
+- **io_uring 封装**：`read` / `write` / `sync_file_range` / `openat` / `close` / `accept` / `connect` / `listen` / `timeout` / `renameat` / `unlinkat` / `mkdirat` / `statx` / `cancel_fd` 等常用操作的异步 awaiter。
 - **C++20 协程支持**：`Task<T>` / `Task<void>`，支持 `co_await` 组合与 `detach()` 的 fire-and-forget 用法。
 - **单线程事件循环**：`Scheduler` 以单线程驱动 io_uring，模型简单、无锁竞争。
 - **协程调试能力**（编译期开关）：异常时打印硬件栈回溯与协程调用链、协程生命周期日志。
@@ -20,6 +20,7 @@
 | 项目 | 要求 | 说明 |
 |---|---|---|
 | 操作系统 | Linux 内核 **5.11+** | io_uring 基础操作 |
+| 内核 5.6+ | `statx` | 依赖 `IORING_OP_STATX`；早于本库 5.11 基线，故无额外要求 |
 | 内核 **5.15+** | `mkdirat` | 依赖 `IORING_OP_MKDIRAT`（`renameat` / `unlinkat` 只需 5.11） |
 | 内核 5.19+ | `cancel_fd` | 异步取消（`IORING_ASYNC_CANCEL_FD`） |
 | 内核 **5.5+** | `TimeoutEvent` / `abandon()` | 依赖 `IORING_OP_ASYNC_CANCEL` 按 `user_data` 取消（`flags = 0`）；`IORING_ASYNC_CANCEL_*` 匹配标志需更新内核，本库当前未使用 |
@@ -93,7 +94,7 @@ int main()
 }
 ```
 
-完整示例见 [`usage.cpp`](./usage.cpp)（含回声服务器、文件读写、目录增删改、超时轮询、`TimeoutEvent`、协程 ID 获取等），协程与 API 的单元测试见 [`yyasio_unittest.cpp`](./yyasio_unittest.cpp)。
+完整示例见 [`usage.cpp`](./usage.cpp)（含回声服务器、文件读写、目录增删改、`statx` 元信息、超时轮询、`TimeoutEvent`、协程 ID 获取等），协程与 API 的单元测试见 [`yyasio_unittest.cpp`](./yyasio_unittest.cpp)。
 
 ### 协程组合与生命周期
 
@@ -182,6 +183,31 @@ yyasio::Task<void> dir_demo(yyasio::Scheduler* scheduler) {
 
 删目录靠 `unlinkat` 加 `AT_REMOVEDIR` 标志（定义在 `<fcntl.h>`，由调用方 include）。**没有递归删除**：目录里还有条目时返回 `-ENOTEMPTY`，需要调用方先清空；同理，不带该标志删目录返回 `-EISDIR`。完整流程见 [`usage.cpp`](./usage.cpp) 的 `directory_ops_demo`。
 
+### 文件元信息（statx）
+
+`statx` 对应系统调用 `statx(2)`：元信息写进调用方提供的 `struct statx`，`co_await` 的返回值是 `statx(2)` 的结果本身（成功 `0`，失败 `-errno`）。`struct statx`、`AT_*` 标志与 `STATX_*` mask 均来自 `<sys/stat.h>`，需调用方自行 include——`yyasio.h` 只前向声明该 struct，因为 wrapper 仅转传指针：
+
+```cpp
+yyasio::Task<void> statx_demo(yyasio::Scheduler* scheduler) {
+    struct statx stx {};
+    // 默认 flags = 0（跟随符号链接），mask = STATX_BASIC_STATS
+    int ret = co_await yyasio::statx(scheduler, AT_FDCWD, "/tmp/a.txt", &stx);
+    std::cout << "size = " << stx.stx_size << ", is_reg = " << S_ISREG(stx.stx_mode) << "\n";
+
+    // AT_SYMLINK_NOFOLLOW：报告链接本身，而不是它的目标
+    struct statx link_self {};
+    co_await yyasio::statx(scheduler, AT_FDCWD, "/tmp/a_link", &link_self, AT_SYMLINK_NOFOLLOW);
+
+    // dirfd + 相对名同样可用
+    int dir_fd = co_await yyasio::openat(scheduler, AT_FDCWD, "/tmp", O_RDONLY | O_DIRECTORY);
+    struct statx relative {};
+    ret = co_await yyasio::statx(scheduler, dir_fd, "a.txt", &relative);
+    co_await yyasio::close(scheduler, dir_fd);
+}
+```
+
+`statxbuf` 与 `path` 都是指针捕获，内核要到 CQE 回来时才写缓冲，所以两者必须存活到操作完成——放在协程帧内的局部变量即可。完整流程（含不存在路径的 `-ENOENT`）见 [`usage.cpp`](./usage.cpp) 的 `statx_demo`。
+
 ### 可用异步 API
 
 均为返回 awaiter 的自由函数，`co_await` 后得到 `int` 结果（io_uring 风格：成功为返回值，失败为 `-errno`）：
@@ -200,6 +226,7 @@ yyasio::Task<void> dir_demo(yyasio::Scheduler* scheduler) {
 | `renameat(sched, olddirfd, old, newdirfd, new, flags=0)` | 重命名（文件与目录同用，对应 `renameat2`） |
 | `unlinkat(sched, dirfd, path, flags=0)` | 删除；删目录传 `flags = AT_REMOVEDIR`，且目录必须已空 |
 | `mkdirat(sched, dirfd, path, mode=0755)` | 创建目录，`mode` 受进程 umask 过滤（需内核 5.15+） |
+| `statx(sched, dirfd, path, buf, flags=0, mask=0x7ff)` | 文件元信息，结果写入 `*buf`，返回 `0` / `-errno`；`mask` 即 `STATX_BASIC_STATS`，`flags` 可传 `AT_SYMLINK_NOFOLLOW`、`AT_EMPTY_PATH`（需 `<sys/stat.h>`，内核 5.6+） |
 | `cancel_fd(sched, fd, flags=0)` | 取消某 fd 上的在途请求 |
 | `ev.wait_until(duration)` | `TimeoutEvent`：最多等待 `duration`，可被 `set()` 提前唤醒，返回 `void` |
 | `ev.set()` | 唤醒等待中的协程，并 `abandon()` 掉未触发的定时器 |
@@ -243,7 +270,7 @@ yyasio::Task<void> dir_demo(yyasio::Scheduler* scheduler) {
    协程体内抛出未捕获异常时，`unhandled_exception()` 会打印栈回溯（若开启宏）后调用 `std::terminate()`，**不做异常跨协程传播**。请在协程内自行 `try/catch`。
 
 6. **awaiter 参数与缓冲区生命周期**
-   awaiter 以指针/引用捕获参数（如 `timeout` 的 `__kernel_timespec*`、`read/write` 的 `buffer`）。在 kernel ≤ 5.9 上 `timeout` 的时间结构体须在操作完成前保持有效；缓冲区须在 IO 完成前存活。建议放在协程帧内的局部变量，跨 `co_await` 保持。
+   awaiter 以指针/引用捕获参数（如 `timeout` 的 `__kernel_timespec*`、`read/write` 的 `buffer`、`statx` 的 `struct statx*` 与 `path`）。在 kernel ≤ 5.9 上 `timeout` 的时间结构体须在操作完成前保持有效；缓冲区须在 IO 完成前存活。建议放在协程帧内的局部变量，跨 `co_await` 保持。
 
 7. **offset 语义**
    `read` / `write` 默认 `offset = 0`，即以文件起始位置作为绝对偏移（io_uring `prep_read/write` 语义），并非从当前游标追加。需要追加写时显式传入 `offset`。

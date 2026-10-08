@@ -247,6 +247,12 @@ constexpr const char* _filename_only(const char* path) {
     do { (void)sizeof(decltype(hint)); (void)sizeof(decltype(coro)); } while(0)
 #endif
 
+// Forward declaration for the statx() wrapper, same trick liburing.h uses for its
+// io_uring_prep_statx: the wrapper only carries the pointer, so <sys/stat.h> stays
+// out of this header. Whoever reads the result includes <sys/stat.h> (and needs it
+// anyway for the AT_* flags and the STATX_* mask bits).
+struct statx;
+
 namespace yyasio
 {
 
@@ -1138,6 +1144,19 @@ inline UringAwaiter mkdirat(Scheduler* scheduler, int dirfd, const char* pathnam
 {
     PrepSqeClosure prepare_sqe_cb = [dirfd, pathname, mode](io_uring_sqe* sqe) -> void {
         io_uring_prep_mkdirat(sqe, dirfd, pathname, mode);
+    };
+    return UringAwaiter{ scheduler, prepare_sqe_cb };
+}
+
+// Requires: kernel >= 5.6 (IORING_OP_STATX).
+// Both path and statxbuf are captured by pointer, not copied, so -- like the path
+// handed to openat/unlinkat -- they must stay alive until the completion arrives:
+// keep them in the awaiting coroutine's own frame, not in a temporary std::string.
+inline UringAwaiter statx(Scheduler* scheduler, int dfd, const char* path, struct statx* statxbuf,
+                          int flags = 0, unsigned mask = 0x7ff /* STATX_BASIC_STATS */)
+{
+    PrepSqeClosure prepare_sqe_cb = [dfd, path, flags, mask, statxbuf](io_uring_sqe* sqe) -> void {
+        io_uring_prep_statx(sqe, dfd, path, flags, mask, statxbuf);
     };
     return UringAwaiter{ scheduler, prepare_sqe_cb };
 }

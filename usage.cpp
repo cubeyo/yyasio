@@ -296,6 +296,77 @@ yyasio::Task<void> sync_file_range_demo(yyasio::Scheduler* scheduler)
     unlink(file_path);
 }
 
+// statx() through io_uring (kernel >= 5.6): the metadata is written into the caller's
+// struct statx, while await_resume() gives back the statx(2) return value itself --
+// 0 on success, -errno otherwise. struct statx and the AT_/STATX_ constants come from
+// <sys/stat.h>, which the caller has to include; yyasio.h only forward declares the
+// struct because the wrapper merely carries the pointer.
+yyasio::Task<void> statx_demo(yyasio::Scheduler* scheduler)
+{
+    std::cout << "=== Statx Demo ===\n";
+
+    const char* file_path = "/tmp/yyasio_statx_demo.txt";
+    const char* link_path = "/tmp/yyasio_statx_demo_link";
+
+    int fd = co_await yyasio::openat(scheduler, AT_FDCWD, file_path, O_RDWR | O_CREAT | O_TRUNC, 0644);
+    if (fd < 0)
+    {
+        std::cerr << "Failed to create file: " << file_path << "\n";
+        co_return;
+    }
+    const char* content = "some bytes for statx";
+    co_await yyasio::write(scheduler, fd, content, strlen(content));
+    co_await yyasio::close(scheduler, fd);
+
+    // The buffer is captured by pointer, so it has to outlive the completion: keeping
+    // it as a local of this coroutine is enough, the frame stays alive while suspended.
+    struct statx stx {};
+    int ret = co_await yyasio::statx(scheduler, AT_FDCWD, file_path, &stx);
+    if (ret < 0)
+    {
+        std::cerr << "statx failed, ret = " << ret << "\n";
+        unlink(file_path);
+        co_return;
+    }
+    std::cout << file_path << ": size = " << stx.stx_size
+              << ", mode = " << std::oct << (stx.stx_mode & 0777) << std::dec
+              << ", nlink = " << stx.stx_nlink
+              << ", is_reg = " << S_ISREG(stx.stx_mode) << "\n";
+
+    // flags = AT_SYMLINK_NOFOLLOW reports the link itself instead of its target
+    if (symlink(file_path, link_path) == 0)
+    {
+        struct statx target {};
+        co_await yyasio::statx(scheduler, AT_FDCWD, link_path, &target);
+        struct statx link_self {};
+        co_await yyasio::statx(scheduler, AT_FDCWD, link_path, &link_self, AT_SYMLINK_NOFOLLOW);
+        std::cout << "via symlink: target size = " << target.stx_size
+                  << ", link itself: is_link = " << S_ISLNK(link_self.stx_mode)
+                  << ", size = " << link_self.stx_size << " (length of the stored path)\n";
+        unlink(link_path);
+    }
+
+    // Same file addressed as dir_fd + relative name. A dfd that gets ignored on the way
+    // into the SQE would resolve against the working directory instead.
+    int dir_fd = co_await yyasio::openat(scheduler, AT_FDCWD, "/tmp", O_RDONLY | O_DIRECTORY);
+    if (dir_fd >= 0)
+    {
+        struct statx relative {};
+        ret = co_await yyasio::statx(scheduler, dir_fd, "yyasio_statx_demo.txt", &relative);
+        std::cout << "through dir_fd + relative name: ret = " << ret
+                  << ", size = " << relative.stx_size
+                  << ", ino matches = " << (relative.stx_ino == stx.stx_ino) << "\n";
+        co_await yyasio::close(scheduler, dir_fd);
+    }
+
+    // Missing path: the error arrives as -errno, no exception involved
+    struct statx ghost {};
+    ret = co_await yyasio::statx(scheduler, AT_FDCWD, "/tmp/yyasio_statx_demo_missing", &ghost);
+    std::cout << "statx on a missing path: ret = " << ret << " (-ENOENT = " << -ENOENT << ")\n";
+
+    unlink(file_path);
+}
+
 yyasio::Task<void> visit_regular_file(yyasio::Scheduler* scheduler)
 {
     int dir_fd = co_await yyasio::openat(scheduler, AT_FDCWD, "/tmp", O_RDONLY | O_DIRECTORY);
@@ -586,6 +657,8 @@ int main()
     directory_ops_demo(&scheduler).detach();
 
     sync_file_range_demo(&scheduler).detach();
+
+    statx_demo(&scheduler).detach();
 
     mutex_demo(&scheduler).detach();
 
