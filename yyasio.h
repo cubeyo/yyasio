@@ -18,6 +18,7 @@
 #include <liburing.h>
 #include <variant>
 #include <atomic>
+#include <thread>
 #include <utility>
 
 #ifndef PRINT_STACK_ON_EXCEPTION
@@ -289,6 +290,14 @@ public:
 
     // CAUTION: if set() is called multiple times before the coroutine is resumed,
     // the last value will be returned and previous set values will be discarded.
+    // CONTRACT: resume() is inline, so the waiting coroutine runs on the caller's
+    // stack: it re-enters await_resume(), its locals and its frame are touched here,
+    // and it keeps executing until its next suspension. Calling set() from another
+    // thread therefore moves that whole coroutine into this thread -- it would reach
+    // Scheduler::schedule()/abandon() (they assert ring affinity) and it would race
+    // every non-thread-safe object it uses. set() returns only after the waiter has
+    // run, which callers and tests rely on; handing the resume off to the loop thread
+    // to make this cross-thread safe would break that synchronously-observed order.
     void set(T value)
     {
         _value = std::move(value);
@@ -381,6 +390,9 @@ struct Mutex
     AwaiterWithGuard lock_guard() { return AwaiterWithGuard(this); }
     Awaiter lock() { return Awaiter(this); }
 
+    // CONTRACT: like Event::set(), unlock() resumes the next waiter inline, so that
+    // coroutine takes over the rest of this thread's stack (and of this call's stack
+    // frames) until it suspends again -- stay on the thread that locks.
     void unlock()
     {
         if (_waiters.empty())
@@ -620,6 +632,13 @@ public:
         }
 
         initialized = true;
+
+        // io_uring is set up SINGLE_ISSUER: only this thread may submit. The plain
+        // containers below (pending_queue/inflight_map/abandoned) are not thread-safe
+        // either, so this thread is also the only one allowed on the IO paths.
+        // A value-initialized std::thread::id denotes no thread at all, so it doubles
+        // as the "no owner recorded yet" sentinel.
+        ring_owner.store(std::this_thread::get_id(), std::memory_order_release);
         return YYASIO_OK;
     }
 
@@ -636,6 +655,7 @@ public:
 
     uint64_t schedule(std::coroutine_handle<> coro, PrepSqeClosure prep_seq_fn, int* presult)
     {
+        assert(on_ring_thread() && "Scheduler::schedule() must run on the init()/run() thread");
         debug_coro("schedule coro:", coro);
         return append_pending_queue(coro, prep_seq_fn, presult);
     }
@@ -648,6 +668,7 @@ public:
     // (from hardware thread which calls scheduler.run())
     void abandon(uint64_t index)
     {
+        assert(on_ring_thread() && "Scheduler::abandon() must run on the init()/run() thread");
         bool io_is_pending = !pending_queue.empty() && index >= pending_queue.front().index && index <= pending_queue.back().index;
         bool io_is_inflight = inflight_map.contains(index);
         if (!io_is_pending && !io_is_inflight)
@@ -688,6 +709,8 @@ public:
             std::cerr << "Scheduler::run() called without a successful init()\n";
             return;
         }
+
+        assert(on_ring_thread() && "Scheduler::run() must be called on the init() thread (SINGLE_ISSUER)");
 
         constexpr uint64_t MAGIC_IDLE_TIMEOUT = 0xFFFFFFFFFFFFFF00ULL;
         constexpr struct __kernel_timespec idle_ts {0, 1000000};
@@ -855,6 +878,12 @@ private:
         return ret;
     }
 
+    bool on_ring_thread() const noexcept
+    {
+        auto owner = ring_owner.load(std::memory_order_acquire);
+        return owner == std::thread::id {} || owner == std::this_thread::get_id();
+    }
+
     io_uring ring {};
     struct PendingItem {
         std::coroutine_handle<> coro;
@@ -876,6 +905,8 @@ private:
     std::unordered_map<uint64_t, InflightItem> inflight_map; // io_idx -> <coro addr, result addr>
 
     std::atomic<bool> stopped{false};
+    // Thread that owns the ring, recorded by init(); value-initialized means "nobody yet".
+    std::atomic<std::thread::id> ring_owner {};
     uint64_t tot_sched_time = 0;
     uint64_t tot_sched_count = 0;
     uint64_t tot_submit_items = 0;
@@ -938,6 +969,9 @@ public:
         return {_scheduler, &_timespec, this};
     }
 
+    // CONTRACT: resumes the waiter inline, exactly like Event::set(), so this call
+    // must come from the thread running the scheduler -- abandon() below asserts it,
+    // and the timeout SQE it cancels belongs to the SINGLE_ISSUER ring.
     void set()
     {
         if (_coro)
