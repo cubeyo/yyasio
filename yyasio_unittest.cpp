@@ -872,6 +872,241 @@ BOOST_AUTO_TEST_CASE(test_unlinkat_nonexistent)
     runner.join();
 }
 
+// ==================== Directory Operations Test (mkdirat / renameat / unlinkat) ====================
+
+static const char* TEST_DIR_PATH = "/tmp/yyasio_test_dir";
+static const char* TEST_DIR_RENAMED_PATH = "/tmp/yyasio_test_dir_renamed";
+static const char* TEST_DIR_CHILD_PATH = "/tmp/yyasio_test_dir/child";
+static const char* TEST_DIR_RENAMED_CHILD_PATH = "/tmp/yyasio_test_dir_renamed/child";
+static const char* TEST_DIR_NONEMPTY_PATH = "/tmp/yyasio_test_dir_nonempty";
+static const char* TEST_DIR_NONEMPTY_FILE_PATH = "/tmp/yyasio_test_dir_nonempty/inner.txt";
+
+// Remove the fixed test paths so every case starts from a clean slate and leftovers
+// from a failing run do not leak into the next one. Children first, then the dirs.
+static void cleanup_dir_test_paths()
+{
+    unlink(TEST_DIR_NONEMPTY_FILE_PATH);
+    unlink(TEST_DIR_CHILD_PATH);
+    unlink(TEST_DIR_RENAMED_CHILD_PATH);
+    rmdir(TEST_DIR_CHILD_PATH);
+    rmdir(TEST_DIR_NONEMPTY_PATH);
+    rmdir(TEST_DIR_PATH);
+    rmdir(TEST_DIR_RENAMED_PATH);
+}
+
+// Create TEST_DIR_PATH twice, then create a relative subdirectory through the dirfd.
+// The duplicate must fail with -EEXIST (proof the request really is a mkdir, not a
+// no-op) and the relative one must succeed (proof dirfd is plumbed through the SQE).
+Task<void> mkdirat_coro(Scheduler* scheduler, std::atomic<int>& root_ret,
+                        std::atomic<int>& dup_ret, std::atomic<int>& child_ret)
+{
+    root_ret.store(co_await mkdirat(scheduler, AT_FDCWD, TEST_DIR_PATH, 0755));
+    std::cout << "mkdirat_coro: root ret = " << root_ret.load() << "\n";
+    BOOST_REQUIRE_EQUAL(root_ret.load(), 0);
+
+    dup_ret.store(co_await mkdirat(scheduler, AT_FDCWD, TEST_DIR_PATH, 0755));
+    std::cout << "mkdirat_coro: duplicate ret = " << dup_ret.load() << "\n";
+
+    int dir_fd = co_await openat(scheduler, AT_FDCWD, TEST_DIR_PATH, O_RDONLY | O_DIRECTORY);
+    BOOST_REQUIRE(dir_fd > 0);
+    child_ret.store(co_await mkdirat(scheduler, dir_fd, "child", 0700));
+    std::cout << "mkdirat_coro: child ret = " << child_ret.load() << "\n";
+    BOOST_CHECK_EQUAL(co_await close(scheduler, dir_fd), 0);
+}
+
+BOOST_AUTO_TEST_CASE(test_mkdirat)
+{
+    cleanup_dir_test_paths();
+
+    // Snapshot the umask while nothing else runs: mkdirat() applies it to `mode`.
+    mode_t cur_umask = ::umask(0);
+    ::umask(cur_umask);
+
+    Scheduler scheduler;
+
+    std::atomic<int> root_ret{-1};
+    std::atomic<int> dup_ret{-1};
+    std::atomic<int> child_ret{-1};
+    mkdirat_coro(&scheduler, root_ret, dup_ret, child_ret).detach();
+
+    std::thread runner([&scheduler]() {
+        run_scheduler(scheduler);
+    });
+
+    auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (child_ret.load() == -1 && std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+
+    // mkdirat() returns 0 on success
+    BOOST_CHECK_EQUAL(root_ret.load(), 0);
+    BOOST_CHECK_EQUAL(dup_ret.load(), -EEXIST);
+    BOOST_CHECK_EQUAL(child_ret.load(), 0);
+
+    // Both paths became directories with the requested mode masked by the umask
+    struct stat st;
+    BOOST_REQUIRE_EQUAL(stat(TEST_DIR_PATH, &st), 0);
+    BOOST_CHECK(S_ISDIR(st.st_mode));
+    BOOST_CHECK_EQUAL(st.st_mode & 0777, 0755 & ~cur_umask);
+
+    BOOST_REQUIRE_EQUAL(stat(TEST_DIR_CHILD_PATH, &st), 0);
+    BOOST_CHECK(S_ISDIR(st.st_mode));
+    BOOST_CHECK_EQUAL(st.st_mode & 0777, 0700 & ~cur_umask);
+
+    cleanup_dir_test_paths();
+    scheduler.stop();
+    runner.join();
+}
+
+// Rename a directory that holds a file: the entry inside has to move along with it.
+Task<void> rename_dir_coro(Scheduler* scheduler, std::atomic<int>& rename_ret)
+{
+    BOOST_REQUIRE_EQUAL(co_await mkdirat(scheduler, AT_FDCWD, TEST_DIR_PATH, 0755), 0);
+
+    int fd = co_await openat(scheduler, AT_FDCWD, TEST_DIR_CHILD_PATH, O_RDWR | O_CREAT | O_TRUNC, 0644);
+    BOOST_REQUIRE(fd > 0);
+    BOOST_CHECK_EQUAL(co_await write(scheduler, fd, TEST_CONTENT, strlen(TEST_CONTENT)),
+                      (int)strlen(TEST_CONTENT));
+    BOOST_CHECK_EQUAL(co_await close(scheduler, fd), 0);
+
+    rename_ret.store(co_await renameat(scheduler, AT_FDCWD, TEST_DIR_PATH, AT_FDCWD, TEST_DIR_RENAMED_PATH));
+    std::cout << "rename_dir_coro: ret = " << rename_ret.load() << "\n";
+}
+
+BOOST_AUTO_TEST_CASE(test_renameat_directory)
+{
+    cleanup_dir_test_paths();
+
+    Scheduler scheduler;
+
+    std::atomic<int> rename_ret{-1};
+    rename_dir_coro(&scheduler, rename_ret).detach();
+
+    std::thread runner([&scheduler]() {
+        run_scheduler(scheduler);
+    });
+
+    auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (rename_ret.load() == -1 && std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+
+    // renameat() returns 0 on success
+    BOOST_CHECK_EQUAL(rename_ret.load(), 0);
+
+    // The old name is gone, the new one is a directory
+    struct stat st;
+    BOOST_CHECK(access(TEST_DIR_PATH, F_OK) != 0);
+    BOOST_REQUIRE_EQUAL(stat(TEST_DIR_RENAMED_PATH, &st), 0);
+    BOOST_CHECK(S_ISDIR(st.st_mode));
+
+    // The entry inside moved with the directory and kept its content
+    int fd = ::open(TEST_DIR_RENAMED_CHILD_PATH, O_RDONLY);
+    BOOST_REQUIRE(fd > 0);
+    char buffer[256] = {0};
+    int bytes_read = ::read(fd, buffer, sizeof(buffer));
+    BOOST_CHECK_EQUAL(bytes_read, (int)strlen(TEST_CONTENT));
+    BOOST_CHECK_EQUAL(std::string(buffer), std::string(TEST_CONTENT));
+    ::close(fd);
+
+    cleanup_dir_test_paths();
+    scheduler.stop();
+    runner.join();
+}
+
+// Remove an empty directory: unlinkat() without AT_REMOVEDIR must refuse, with the
+// flag the directory is gone.
+Task<void> remove_empty_dir_coro(Scheduler* scheduler, std::atomic<int>& plain_ret,
+                                 std::atomic<int>& removedir_ret)
+{
+    BOOST_REQUIRE_EQUAL(co_await mkdirat(scheduler, AT_FDCWD, TEST_DIR_PATH, 0755), 0);
+
+    plain_ret.store(co_await unlinkat(scheduler, AT_FDCWD, TEST_DIR_PATH, 0));
+    std::cout << "remove_empty_dir_coro: unlink without flag ret = " << plain_ret.load() << "\n";
+
+    removedir_ret.store(co_await unlinkat(scheduler, AT_FDCWD, TEST_DIR_PATH, AT_REMOVEDIR));
+    std::cout << "remove_empty_dir_coro: unlink with AT_REMOVEDIR ret = " << removedir_ret.load() << "\n";
+}
+
+BOOST_AUTO_TEST_CASE(test_unlinkat_empty_directory)
+{
+    cleanup_dir_test_paths();
+
+    Scheduler scheduler;
+
+    std::atomic<int> plain_ret{-1};
+    std::atomic<int> removedir_ret{-1};
+    remove_empty_dir_coro(&scheduler, plain_ret, removedir_ret).detach();
+
+    std::thread runner([&scheduler]() {
+        run_scheduler(scheduler);
+    });
+
+    auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (removedir_ret.load() == -1 && std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+
+    // Directories are not removable through the plain unlink path (EISDIR on recent
+    // kernels, EPERM historically) - the flag is what distinguishes the two.
+    BOOST_CHECK_LT(plain_ret.load(), 0);
+
+    // unlinkat(dir, AT_REMOVEDIR) returns 0 and the directory is really gone
+    BOOST_CHECK_EQUAL(removedir_ret.load(), 0);
+    BOOST_CHECK(access(TEST_DIR_PATH, F_OK) != 0);
+    scheduler.stop();
+    runner.join();
+}
+
+// A directory that still holds an entry cannot be removed: the kernel answers
+// -ENOTEMPTY. yyasio has no recursive delete, so the caller has to empty the
+// directory first; the same call then succeeds.
+Task<void> remove_nonempty_dir_coro(Scheduler* scheduler, std::atomic<int>& busy_ret,
+                                    std::atomic<int>& empty_ret)
+{
+    BOOST_REQUIRE_EQUAL(co_await mkdirat(scheduler, AT_FDCWD, TEST_DIR_NONEMPTY_PATH, 0755), 0);
+
+    int fd = co_await openat(scheduler, AT_FDCWD, TEST_DIR_NONEMPTY_FILE_PATH, O_RDWR | O_CREAT | O_TRUNC, 0644);
+    BOOST_REQUIRE(fd > 0);
+    BOOST_CHECK_EQUAL(co_await close(scheduler, fd), 0);
+
+    busy_ret.store(co_await unlinkat(scheduler, AT_FDCWD, TEST_DIR_NONEMPTY_PATH, AT_REMOVEDIR));
+    std::cout << "remove_nonempty_dir_coro: non-empty ret = " << busy_ret.load() << "\n";
+
+    BOOST_REQUIRE_EQUAL(co_await unlinkat(scheduler, AT_FDCWD, TEST_DIR_NONEMPTY_FILE_PATH, 0), 0);
+    empty_ret.store(co_await unlinkat(scheduler, AT_FDCWD, TEST_DIR_NONEMPTY_PATH, AT_REMOVEDIR));
+    std::cout << "remove_nonempty_dir_coro: after-emptying ret = " << empty_ret.load() << "\n";
+}
+
+BOOST_AUTO_TEST_CASE(test_unlinkat_nonempty_directory)
+{
+    cleanup_dir_test_paths();
+
+    Scheduler scheduler;
+
+    std::atomic<int> busy_ret{-1};
+    std::atomic<int> empty_ret{-1};
+    remove_nonempty_dir_coro(&scheduler, busy_ret, empty_ret).detach();
+
+    std::thread runner([&scheduler]() {
+        run_scheduler(scheduler);
+    });
+
+    auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (empty_ret.load() == -1 && std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+
+    BOOST_CHECK_EQUAL(busy_ret.load(), -ENOTEMPTY);
+    BOOST_CHECK_EQUAL(empty_ret.load(), 0);
+
+    // Nothing left behind under either name
+    BOOST_CHECK(access(TEST_DIR_NONEMPTY_PATH, F_OK) != 0);
+    BOOST_CHECK(access(TEST_DIR_NONEMPTY_FILE_PATH, F_OK) != 0);
+    scheduler.stop();
+    runner.join();
+}
+
 // ==================== SyncFileRange Test ====================
 
 static const char* TEST_SYNC_FILE_PATH = "/tmp/yyasio_test_sync_range.txt";

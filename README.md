@@ -7,7 +7,7 @@
 ## 特性
 
 - **Header-only**：单个头文件 `yyasio.h`，拷贝即用。
-- **io_uring 封装**：`read` / `write` / `sync_file_range` / `openat` / `close` / `accept` / `connect` / `listen` / `timeout` / `renameat` / `unlinkat` / `cancel_fd` 等常用操作的异步 awaiter。
+- **io_uring 封装**：`read` / `write` / `sync_file_range` / `openat` / `close` / `accept` / `connect` / `listen` / `timeout` / `renameat` / `unlinkat` / `mkdirat` / `cancel_fd` 等常用操作的异步 awaiter。
 - **C++20 协程支持**：`Task<T>` / `Task<void>`，支持 `co_await` 组合与 `detach()` 的 fire-and-forget 用法。
 - **单线程事件循环**：`Scheduler` 以单线程驱动 io_uring，模型简单、无锁竞争。
 - **协程调试能力**（编译期开关）：异常时打印硬件栈回溯与协程调用链、协程生命周期日志。
@@ -20,6 +20,7 @@
 | 项目 | 要求 | 说明 |
 |---|---|---|
 | 操作系统 | Linux 内核 **5.11+** | io_uring 基础操作 |
+| 内核 **5.15+** | `mkdirat` | 依赖 `IORING_OP_MKDIRAT`（`renameat` / `unlinkat` 只需 5.11） |
 | 内核 5.19+ | `cancel_fd` | 异步取消（`IORING_ASYNC_CANCEL_FD`） |
 | 内核 **5.5+** | `TimeoutEvent` / `abandon()` | 依赖 `IORING_OP_ASYNC_CANCEL` 按 `user_data` 取消（`flags = 0`）；`IORING_ASYNC_CANCEL_*` 匹配标志需更新内核，本库当前未使用 |
 | 内核 **6.0+** | 可选优化 | `IORING_SETUP_SINGLE_ISSUER` / `IORING_SETUP_DEFER_TASKRUN`；低版本内核会自动回退到无 flag 模式 |
@@ -92,7 +93,7 @@ int main()
 }
 ```
 
-完整示例见 [`usage.cpp`](./usage.cpp)（含回声服务器、文件读写、超时轮询、`TimeoutEvent`、协程 ID 获取等），协程与 API 的单元测试见 [`yyasio_unittest.cpp`](./yyasio_unittest.cpp)。
+完整示例见 [`usage.cpp`](./usage.cpp)（含回声服务器、文件读写、目录增删改、超时轮询、`TimeoutEvent`、协程 ID 获取等），协程与 API 的单元测试见 [`yyasio_unittest.cpp`](./yyasio_unittest.cpp)。
 
 ### 协程组合与生命周期
 
@@ -167,6 +168,20 @@ if (mtx.try_lock()) { ... mtx.unlock(); }  // 非阻塞尝试加锁
 
 采用**所有权转移** + FIFO 等待队列：`unlock()` 不会把锁交给尚未排队的 `lock()` 调用者（防插队）。注意与 `Scheduler` 一致，`Mutex` **非线程安全**，共享同一把锁的协程必须跑在同一个调度器（同一线程）上；另外锁若在协程帧中声明，需保证帧存活期覆盖所有等待者，见 [`usage.cpp`](./usage.cpp) 的 `mutex_demo` / `lock_guard_demo`。
 
+### 目录操作
+
+`mkdirat` / `renameat` / `unlinkat` 直接对应同名系统调用，`dirfd` 传 `AT_FDCWD` 则路径按当前工作目录解析，传目录 fd 则按该目录相对解析（打开目录用 `openat(..., O_RDONLY | O_DIRECTORY)`）：
+
+```cpp
+yyasio::Task<void> dir_demo(yyasio::Scheduler* scheduler) {
+    int ret = co_await yyasio::mkdirat(scheduler, AT_FDCWD, "/tmp/a_dir");        // 默认 0755
+    ret = co_await yyasio::renameat(scheduler, AT_FDCWD, "/tmp/a_dir", AT_FDCWD, "/tmp/b_dir");
+    ret = co_await yyasio::unlinkat(scheduler, AT_FDCWD, "/tmp/b_dir", AT_REMOVEDIR); // 删目录
+}
+```
+
+删目录靠 `unlinkat` 加 `AT_REMOVEDIR` 标志（定义在 `<fcntl.h>`，由调用方 include）。**没有递归删除**：目录里还有条目时返回 `-ENOTEMPTY`，需要调用方先清空；同理，不带该标志删目录返回 `-EISDIR`。完整流程见 [`usage.cpp`](./usage.cpp) 的 `directory_ops_demo`。
+
 ### 可用异步 API
 
 均为返回 awaiter 的自由函数，`co_await` 后得到 `int` 结果（io_uring 风格：成功为返回值，失败为 `-errno`）：
@@ -182,8 +197,9 @@ if (mtx.try_lock()) { ... mtx.unlock(); }  // 非阻塞尝试加锁
 | `connect(sched, fd, addr, len)` | 发起连接 |
 | `listen(sched, fd, backlog=SOMAXCONN)` | 监听（io_uring 原生支持） |
 | `timeout(sched, ts, count=0, flags=0)` | 定时器 |
-| `renameat(sched, olddirfd, old, newdirfd, new, flags=0)` | 重命名 |
-| `unlinkat(sched, dirfd, path, flags=0)` | 删除 |
+| `renameat(sched, olddirfd, old, newdirfd, new, flags=0)` | 重命名（文件与目录同用，对应 `renameat2`） |
+| `unlinkat(sched, dirfd, path, flags=0)` | 删除；删目录传 `flags = AT_REMOVEDIR`，且目录必须已空 |
+| `mkdirat(sched, dirfd, path, mode=0755)` | 创建目录，`mode` 受进程 umask 过滤（需内核 5.15+） |
 | `cancel_fd(sched, fd, flags=0)` | 取消某 fd 上的在途请求 |
 | `ev.wait_until(duration)` | `TimeoutEvent`：最多等待 `duration`，可被 `set()` 提前唤醒，返回 `void` |
 | `ev.set()` | 唤醒等待中的协程，并 `abandon()` 掉未触发的定时器 |

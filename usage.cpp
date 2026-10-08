@@ -177,6 +177,82 @@ yyasio::Task<void> unlink_file_demo(yyasio::Scheduler* scheduler)
     }
 }
 
+// Directory lifecycle through io_uring: mkdirat -> renameat -> unlinkat.
+// Note there is no recursive remove: unlinkat(AT_REMOVEDIR) on a directory that
+// still holds entries comes back with -ENOTEMPTY, so the caller has to empty it.
+yyasio::Task<void> directory_ops_demo(yyasio::Scheduler* scheduler)
+{
+    std::cout << "=== Directory Ops Demo ===\n";
+
+    const char* dir_path = "/tmp/yyasio_demo_dir";
+    const char* renamed_dir_path = "/tmp/yyasio_demo_dir_renamed";
+    const char* inner_file_path = "/tmp/yyasio_demo_dir/inner.txt";
+    const char* renamed_inner_file_path = "/tmp/yyasio_demo_dir_renamed/inner.txt";
+
+    // Drop whatever a previous run left behind
+    unlink(inner_file_path);
+    unlink(renamed_inner_file_path);
+    rmdir(dir_path);
+    rmdir(renamed_dir_path);
+
+    int ret = co_await yyasio::mkdirat(scheduler, AT_FDCWD, dir_path, 0755);
+    if (ret < 0)
+    {
+        std::cerr << "mkdir failed, ret = " << ret << "\n";
+        co_return;
+    }
+    struct stat st;
+    if (stat(dir_path, &st) == 0)
+    {
+        std::cout << "Created directory: " << dir_path << ", is_dir = " << S_ISDIR(st.st_mode)
+                  << ", mode = " << std::oct << (st.st_mode & 0777) << std::dec << "\n";
+    }
+
+    // Put a file inside, so the directory is no longer empty
+    int fd = co_await yyasio::openat(scheduler, AT_FDCWD, inner_file_path, O_RDWR | O_CREAT | O_TRUNC, 0644);
+    if (fd < 0)
+    {
+        std::cerr << "Failed to create file: " << inner_file_path << "\n";
+        co_return;
+    }
+    const char* content = "content inside the directory";
+    co_await yyasio::write(scheduler, fd, content, strlen(content));
+    co_await yyasio::close(scheduler, fd);
+
+    // Rename the directory - the entry inside moves along with it
+    ret = co_await yyasio::renameat(scheduler, AT_FDCWD, dir_path, AT_FDCWD, renamed_dir_path);
+    if (ret < 0)
+    {
+        std::cerr << "Rename directory failed, ret = " << ret << "\n";
+        co_return;
+    }
+    std::cout << "Renamed " << dir_path << " -> " << renamed_dir_path << "\n";
+    if (stat(renamed_inner_file_path, &st) == 0)
+    {
+        std::cout << "Inner file moved with the directory, size = " << st.st_size << " bytes\n";
+    }
+
+    // Removing a non-empty directory is refused
+    ret = co_await yyasio::unlinkat(scheduler, AT_FDCWD, renamed_dir_path, AT_REMOVEDIR);
+    std::cout << "unlinkat(AT_REMOVEDIR) on non-empty dir: ret = " << ret
+              << " (-ENOTEMPTY = " << -ENOTEMPTY << ")\n";
+
+    // Empty it first, then the same call succeeds
+    ret = co_await yyasio::unlinkat(scheduler, AT_FDCWD, renamed_inner_file_path, 0);
+    if (ret < 0)
+    {
+        std::cerr << "Failed to unlink inner file, ret = " << ret << "\n";
+        co_return;
+    }
+    ret = co_await yyasio::unlinkat(scheduler, AT_FDCWD, renamed_dir_path, AT_REMOVEDIR);
+    if (ret < 0)
+    {
+        std::cerr << "Failed to remove empty directory, ret = " << ret << "\n";
+        co_return;
+    }
+    std::cout << "Removed empty directory: " << renamed_dir_path << "\n";
+}
+
 yyasio::Task<void> sync_file_range_demo(yyasio::Scheduler* scheduler)
 {
     std::cout << "=== Sync File Range Demo ===\n";
@@ -506,6 +582,8 @@ int main()
     rename_file_demo(&scheduler).detach();
 
     unlink_file_demo(&scheduler).detach();
+
+    directory_ops_demo(&scheduler).detach();
 
     sync_file_range_demo(&scheduler).detach();
 

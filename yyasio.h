@@ -1099,4 +1099,13 @@ inline UringAwaiter unlinkat(Scheduler* scheduler, int dirfd, const char* pathna
     return UringAwaiter{ scheduler, prepare_sqe_cb };
 }
 
+// Requires: kernel >= 5.15 (IORING_OP_MKDIRAT)
+inline UringAwaiter mkdirat(Scheduler* scheduler, int dirfd, const char* pathname, mode_t mode = 0755)
+{
+    PrepSqeClosure prepare_sqe_cb = [dirfd, pathname, mode](io_uring_sqe* sqe) -> void {
+        io_uring_prep_mkdirat(sqe, dirfd, pathname, mode);
+    };
+    return UringAwaiter{ scheduler, prepare_sqe_cb };
+}
+
 } // namespace yyasio
