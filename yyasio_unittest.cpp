@@ -6,7 +6,9 @@
 #include <atomic>
 #include <limits>
 #include <memory>
+#include <random>
 #include <string>
+#include <vector>
 #include <thread>
 #include <chrono>
 #include <cstring>
@@ -19,14 +21,20 @@
 
 using namespace yyasio;
 
-// Drives one scheduler the way every IO test needs it. init(), run() and shutdown()
-// all have to happen on the loop thread (the ring is set up SINGLE_ISSUER), which is
-// why the release lives here instead of after runner.join() in the test body.
-static void run_scheduler(Scheduler& scheduler)
+// Drives one scheduler the way every IO test needs it. init(), the detach() calls that
+// start the coroutines and run() all have to happen on the loop thread: Scheduler only
+// accepts IO while it runs (the ring is SINGLE_ISSUER), so detaching from the test body
+// before this thread exists would hand every awaiter a -ECANCELED instead of doing IO.
+// run() releases the ring and the control pipe itself when it returns, so there is no
+// separate shutdown() call any more.
+static void run_scheduler(Scheduler& scheduler, const std::function<void()>& start = nullptr)
 {
     BOOST_REQUIRE_EQUAL(scheduler.init(16), YYASIO_OK);
+    if (start)
+    {
+        start();
+    }
     scheduler.run();
-    scheduler.shutdown();
 }
 
 BOOST_AUTO_TEST_SUITE(YYasioTests)
@@ -163,10 +171,11 @@ BOOST_AUTO_TEST_CASE(test_openat)
     Scheduler scheduler;
 
     std::atomic<int> fd{-1};
-    open_file_coro(&scheduler, fd).detach();
 
-    std::thread runner([&scheduler]() {
-        run_scheduler(scheduler);
+    std::thread runner([&]() {
+        run_scheduler(scheduler, [&]() {
+            open_file_coro(&scheduler, fd).detach();
+        });
     });
 
     auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
@@ -200,10 +209,11 @@ BOOST_AUTO_TEST_CASE(test_write)
     Scheduler scheduler;
 
     std::atomic<int> bytes_written{0};
-    write_file_coro(&scheduler, fd, bytes_written).detach();
 
-    std::thread runner([&scheduler]() {
-        run_scheduler(scheduler);
+    std::thread runner([&]() {
+        run_scheduler(scheduler, [&]() {
+            write_file_coro(&scheduler, fd, bytes_written).detach();
+        });
     });
 
     auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
@@ -238,10 +248,11 @@ BOOST_AUTO_TEST_CASE(test_read)
 
     char buffer[256] = {0};
     std::atomic<int> bytes_read{0};
-    read_file_coro(&scheduler, fd, buffer, sizeof(buffer), bytes_read).detach();
 
-    std::thread runner([&scheduler]() {
-        run_scheduler(scheduler);
+    std::thread runner([&]() {
+        run_scheduler(scheduler, [&]() {
+            read_file_coro(&scheduler, fd, buffer, sizeof(buffer), bytes_read).detach();
+        });
     });
 
     auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
@@ -274,10 +285,11 @@ BOOST_AUTO_TEST_CASE(test_close)
     Scheduler scheduler;
 
     std::atomic<int> close_result{-1};
-    close_file_coro(&scheduler, fd, close_result).detach();
 
-    std::thread runner([&scheduler]() {
-        run_scheduler(scheduler);
+    std::thread runner([&]() {
+        run_scheduler(scheduler, [&]() {
+            close_file_coro(&scheduler, fd, close_result).detach();
+        });
     });
 
     auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
@@ -327,10 +339,11 @@ BOOST_AUTO_TEST_CASE(test_file_io_combined)
     Scheduler scheduler;
 
     std::atomic<bool> done{false};
-    file_io_combined_coro(&scheduler, done).detach();
 
-    std::thread runner([&scheduler]() {
-        run_scheduler(scheduler);
+    std::thread runner([&]() {
+        run_scheduler(scheduler, [&]() {
+            file_io_combined_coro(&scheduler, done).detach();
+        });
     });
 
     auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
@@ -371,13 +384,12 @@ BOOST_AUTO_TEST_CASE(test_coroutine_return_value)
 
     std::atomic<int> result{0};
 
-    // Start the parent coroutine - it will co_await the child
-    get_return_value(&scheduler, result).detach();
-
-    // Run scheduler in background thread (run() is blocking)
-    // init() and run() must be on the same thread (IORING_SETUP_SINGLE_ISSUER)
-    std::thread runner([&scheduler]() {
-        run_scheduler(scheduler);
+    // Start the parent coroutine - it will co_await the child.
+    // run() blocks, so init()/detach()/run() all live on this runner thread.
+    std::thread runner([&]() {
+        run_scheduler(scheduler, [&]() {
+            get_return_value(&scheduler, result).detach();
+        });
     });
 
     // Wait for result with timeout
@@ -412,10 +424,10 @@ BOOST_AUTO_TEST_CASE(test_timeout)
     std::atomic<long> elapsed_ns{0};
     long timeout_ns = 100'000'000; // 100ms
 
-    timeout_coro(&scheduler, timeout_ns, result, elapsed_ns).detach();
-
-    std::thread runner([&scheduler]() {
-        run_scheduler(scheduler);
+    std::thread runner([&]() {
+        run_scheduler(scheduler, [&]() {
+            timeout_coro(&scheduler, timeout_ns, result, elapsed_ns).detach();
+        });
     });
 
     auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
@@ -456,10 +468,10 @@ BOOST_AUTO_TEST_CASE(test_sleep_expiry)
     std::atomic<long> elapsed_ns{0};
     long want_ns = 200 * SLEEP_UNIT_NS;
 
-    sleep_once(&scheduler, 200, result, elapsed_ns).detach();
-
-    std::thread runner([&scheduler]() {
-        run_scheduler(scheduler);
+    std::thread runner([&]() {
+        run_scheduler(scheduler, [&]() {
+            sleep_once(&scheduler, 200, result, elapsed_ns).detach();
+        });
     });
 
     auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
@@ -486,10 +498,10 @@ BOOST_AUTO_TEST_CASE(test_sleep_sub_second_not_truncated)
     std::atomic<long> elapsed_ns{0};
     long want_ns = 50 * SLEEP_UNIT_NS;
 
-    sleep_once(&scheduler, 50, result, elapsed_ns).detach();
-
-    std::thread runner([&scheduler]() {
-        run_scheduler(scheduler);
+    std::thread runner([&]() {
+        run_scheduler(scheduler, [&]() {
+            sleep_once(&scheduler, 50, result, elapsed_ns).detach();
+        });
     });
 
     auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
@@ -514,10 +526,10 @@ BOOST_AUTO_TEST_CASE(test_sleep_negative_clamped)
     std::atomic<int> result{0};
     std::atomic<long> elapsed_ns{0};
 
-    sleep_once(&scheduler, -50, result, elapsed_ns).detach();
-
-    std::thread runner([&scheduler]() {
-        run_scheduler(scheduler);
+    std::thread runner([&]() {
+        run_scheduler(scheduler, [&]() {
+            sleep_once(&scheduler, -50, result, elapsed_ns).detach();
+        });
     });
 
     auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
@@ -576,14 +588,14 @@ BOOST_AUTO_TEST_CASE(test_sleep_concurrent_with_io)
     const long msecs[3] = {50, 120, 190};
 
     auto wall_start = std::chrono::steady_clock::now();
-    for (int i = 0; i < 3; i++)
-    {
-        sleep_recorded(&scheduler, msecs[i], &recs[i], done_count).detach();
-    }
-    open_close_recorded(&scheduler, &recs[3], done_count).detach();
-
-    std::thread runner([&scheduler]() {
-        run_scheduler(scheduler);
+    std::thread runner([&]() {
+        run_scheduler(scheduler, [&]() {
+            for (int i = 0; i < 3; i++)
+            {
+                sleep_recorded(&scheduler, msecs[i], &recs[i], done_count).detach();
+            }
+            open_close_recorded(&scheduler, &recs[3], done_count).detach();
+        });
     });
 
     auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
@@ -603,6 +615,86 @@ BOOST_AUTO_TEST_CASE(test_sleep_concurrent_with_io)
     BOOST_CHECK_GE(recs[3].ret.load(), 0);   // the openat fd, i.e. IO did go through
     // Concurrent timers finish with the longest one (~190ms), not after their sum (~360ms).
     BOOST_CHECK_LT(wall_ns, 310 * SLEEP_UNIT_NS);
+    scheduler.stop();
+    runner.join();
+}
+
+// ==================== run_in_thread Test ====================
+
+// 1000 个带外任务同时在飞：每个工作线程随机睡 1~100ms，然后返回自己的编号。
+// 校验点：
+//   1) 每个协程都拿到 rc == 0 且值正好是自己的编号 —— ticket 与协程严格一一对应，
+//      没串号、没丢唤醒；1000 条票在 pipe 里会被合并成很少的 poll CQE，
+//      所以这条同时压到 drain 的批量路径与 coros_waiting_for_extern_wakeup 的查表。
+//   2) 全部完成（否则 finished 不满，deadline 到点后失败）。
+constexpr int kRitJobs = 1000;
+
+Task<void> rit_job(Scheduler* scheduler, int id, int sleep_ms,
+                   std::atomic<int>* results, std::atomic<int>& good, std::atomic<int>& bad,
+                   std::atomic<int>& finished)
+{
+    auto [rc, got] = co_await yyasio::run_in_thread<int>(scheduler, [id, sleep_ms] {
+        std::this_thread::sleep_for(std::chrono::milliseconds(sleep_ms));
+        return id;
+    });
+    // 失败时把负的错误码存进去，方便诊断（正常路径下就是任务编号）
+    results[id].store(rc == 0 ? got : rc);
+    if (rc == 0 && got == id)
+    {
+        good.fetch_add(1);
+    }
+    else
+    {
+        bad.fetch_add(1);
+    }
+    finished.fetch_add(1);
+}
+
+BOOST_AUTO_TEST_CASE(test_run_in_thread_many_concurrent)
+{
+    Scheduler scheduler;
+
+    auto results = std::make_unique<std::atomic<int>[]>(kRitJobs);   // value-init → 全 0
+    std::atomic<int> good{0};
+    std::atomic<int> bad{0};
+    std::atomic<int> finished{0};
+
+    // 随机时长在测试线程里先算好：工作线程不共享 rand()，也不会引入额外的竞态
+    std::vector<int> sleeps(kRitJobs);
+    std::mt19937 rng(20261010);
+    std::uniform_int_distribution<int> dist(1, 100);
+    for (int& v : sleeps)
+    {
+        v = dist(rng);
+    }
+
+    auto wall_start = std::chrono::steady_clock::now();
+    std::thread runner([&]() {
+        run_scheduler(scheduler, [&]() {
+            for (int i = 0; i < kRitJobs; i++)
+            {
+                rit_job(&scheduler, i, sleeps[i], results.get(), good, bad, finished).detach();
+            }
+        });
+    });
+
+    auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(60);
+    while (finished.load() < kRitJobs && std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    long long wall_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - wall_start).count();
+    std::cout << "run_in_thread x" << kRitJobs << ": wall = " << wall_ms << " ms, good = " << good.load()
+              << ", bad = " << bad.load() << "\n";
+    BOOST_CHECK_EQUAL(finished.load(), kRitJobs);
+
+    BOOST_CHECK_EQUAL(bad.load(), 0);
+    BOOST_CHECK_EQUAL(good.load(), kRitJobs);
+    for (int i = 0; i < kRitJobs; i++)
+    {
+        BOOST_CHECK_EQUAL(results[i].load(), i);
+    }
+
     scheduler.stop();
     runner.join();
 }
@@ -819,14 +911,14 @@ BOOST_AUTO_TEST_CASE(test_connect)
     std::atomic<int> connect_result{-1};
     std::atomic<int> write_result{0};
 
-    // Start server coroutine
-    accept_one_connection(&scheduler, listen_fd, accepted, read_buf, sizeof(read_buf), bytes_read).detach();
-
-    // Start client coroutine
-    connect_and_send_test(&scheduler, 18080, connect_result, write_result).detach();
-
-    std::thread runner([&scheduler]() {
-        run_scheduler(scheduler);
+    // Both coroutines start from inside the loop thread, right after init().
+    std::thread runner([&]() {
+        run_scheduler(scheduler, [&]() {
+            // Start server coroutine
+            accept_one_connection(&scheduler, listen_fd, accepted, read_buf, sizeof(read_buf), bytes_read).detach();
+            // Start client coroutine
+            connect_and_send_test(&scheduler, 18080, connect_result, write_result).detach();
+        });
     });
 
     // Wait for both to complete (including read operation)
@@ -876,10 +968,11 @@ BOOST_AUTO_TEST_CASE(test_listen)
     Scheduler scheduler;
 
     std::atomic<int> listen_result{-1};
-    listen_coro(&scheduler, listen_fd, listen_result).detach();
 
-    std::thread runner([&scheduler]() {
-        run_scheduler(scheduler);
+    std::thread runner([&]() {
+        run_scheduler(scheduler, [&]() {
+            listen_coro(&scheduler, listen_fd, listen_result).detach();
+        });
     });
 
     auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
@@ -939,10 +1032,10 @@ BOOST_AUTO_TEST_CASE(test_renameat)
     Scheduler scheduler;
 
     std::atomic<int> rename_result{-1};
-    renameat_coro(&scheduler, AT_FDCWD, TEST_OLD_FILE_PATH, AT_FDCWD, TEST_NEW_FILE_PATH, rename_result).detach();
-
-    std::thread runner([&scheduler]() {
-        run_scheduler(scheduler);
+    std::thread runner([&]() {
+        run_scheduler(scheduler, [&]() {
+            renameat_coro(&scheduler, AT_FDCWD, TEST_OLD_FILE_PATH, AT_FDCWD, TEST_NEW_FILE_PATH, rename_result).detach();
+        });
     });
 
     auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
@@ -997,10 +1090,10 @@ BOOST_AUTO_TEST_CASE(test_unlinkat)
     Scheduler scheduler;
 
     std::atomic<int> unlink_result{-1};
-    unlinkat_coro(&scheduler, AT_FDCWD, TEST_UNLINK_FILE_PATH, 0, unlink_result).detach();
-
-    std::thread runner([&scheduler]() {
-        run_scheduler(scheduler);
+    std::thread runner([&]() {
+        run_scheduler(scheduler, [&]() {
+            unlinkat_coro(&scheduler, AT_FDCWD, TEST_UNLINK_FILE_PATH, 0, unlink_result).detach();
+        });
     });
 
     auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
@@ -1030,10 +1123,10 @@ BOOST_AUTO_TEST_CASE(test_unlinkat_nonexistent)
     Scheduler scheduler;
 
     std::atomic<int> unlink_result{0};
-    unlinkat_nonexist_coro(&scheduler, unlink_result).detach();
-
-    std::thread runner([&scheduler]() {
-        run_scheduler(scheduler);
+    std::thread runner([&]() {
+        run_scheduler(scheduler, [&]() {
+            unlinkat_nonexist_coro(&scheduler, unlink_result).detach();
+        });
     });
 
     auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
@@ -1103,10 +1196,10 @@ BOOST_AUTO_TEST_CASE(test_mkdirat)
     std::atomic<int> root_ret{-1};
     std::atomic<int> dup_ret{-1};
     std::atomic<int> child_ret{-1};
-    mkdirat_coro(&scheduler, root_ret, dup_ret, child_ret).detach();
-
-    std::thread runner([&scheduler]() {
-        run_scheduler(scheduler);
+    std::thread runner([&]() {
+        run_scheduler(scheduler, [&]() {
+            mkdirat_coro(&scheduler, root_ret, dup_ret, child_ret).detach();
+        });
     });
 
     auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
@@ -1156,10 +1249,10 @@ BOOST_AUTO_TEST_CASE(test_renameat_directory)
     Scheduler scheduler;
 
     std::atomic<int> rename_ret{-1};
-    rename_dir_coro(&scheduler, rename_ret).detach();
-
-    std::thread runner([&scheduler]() {
-        run_scheduler(scheduler);
+    std::thread runner([&]() {
+        run_scheduler(scheduler, [&]() {
+            rename_dir_coro(&scheduler, rename_ret).detach();
+        });
     });
 
     auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
@@ -1212,10 +1305,10 @@ BOOST_AUTO_TEST_CASE(test_unlinkat_empty_directory)
 
     std::atomic<int> plain_ret{-1};
     std::atomic<int> removedir_ret{-1};
-    remove_empty_dir_coro(&scheduler, plain_ret, removedir_ret).detach();
-
-    std::thread runner([&scheduler]() {
-        run_scheduler(scheduler);
+    std::thread runner([&]() {
+        run_scheduler(scheduler, [&]() {
+            remove_empty_dir_coro(&scheduler, plain_ret, removedir_ret).detach();
+        });
     });
 
     auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
@@ -1262,10 +1355,10 @@ BOOST_AUTO_TEST_CASE(test_unlinkat_nonempty_directory)
 
     std::atomic<int> busy_ret{-1};
     std::atomic<int> empty_ret{-1};
-    remove_nonempty_dir_coro(&scheduler, busy_ret, empty_ret).detach();
-
-    std::thread runner([&scheduler]() {
-        run_scheduler(scheduler);
+    std::thread runner([&]() {
+        run_scheduler(scheduler, [&]() {
+            remove_nonempty_dir_coro(&scheduler, busy_ret, empty_ret).detach();
+        });
     });
 
     auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
@@ -1395,10 +1488,10 @@ BOOST_AUTO_TEST_CASE(test_statx)
 
     StatxProbe probe;
     std::atomic<int> last_ret{-1};
-    statx_coro(&scheduler, dir_fd, probe, last_ret).detach();
-
-    std::thread runner([&scheduler]() {
-        run_scheduler(scheduler);
+    std::thread runner([&]() {
+        run_scheduler(scheduler, [&]() {
+            statx_coro(&scheduler, dir_fd, probe, last_ret).detach();
+        });
     });
 
     auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
@@ -1460,12 +1553,12 @@ BOOST_AUTO_TEST_CASE(test_sync_file_range)
 
     std::atomic<int> sync_result{-1};
     // WAIT_BEFORE|WRITE|WAIT_AFTER: flush the range and wait for stable storage
-    sync_file_range_coro(&scheduler, fd, 0, strlen(TEST_CONTENT),
-                         SYNC_FILE_RANGE_WAIT_BEFORE | SYNC_FILE_RANGE_WRITE | SYNC_FILE_RANGE_WAIT_AFTER,
-                         sync_result).detach();
-
-    std::thread runner([&scheduler]() {
-        run_scheduler(scheduler);
+    std::thread runner([&]() {
+        run_scheduler(scheduler, [&]() {
+            sync_file_range_coro(&scheduler, fd, 0, strlen(TEST_CONTENT),
+                                 SYNC_FILE_RANGE_WAIT_BEFORE | SYNC_FILE_RANGE_WRITE | SYNC_FILE_RANGE_WAIT_AFTER,
+                                 sync_result).detach();
+        });
     });
 
     auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
@@ -1500,10 +1593,10 @@ BOOST_AUTO_TEST_CASE(test_sync_file_range_badfd)
     Scheduler scheduler;
 
     std::atomic<int> sync_result{0};
-    sync_file_range_badfd_coro(&scheduler, sync_result).detach();
-
-    std::thread runner([&scheduler]() {
-        run_scheduler(scheduler);
+    std::thread runner([&]() {
+        run_scheduler(scheduler, [&]() {
+            sync_file_range_badfd_coro(&scheduler, sync_result).detach();
+        });
     });
 
     auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
@@ -1533,6 +1626,26 @@ Task<void> mutex_locked_incr(Scheduler* scheduler, Mutex& mtx, long hold_ns,
     done.fetch_add(1);
 }
 
+// Mutex is not thread safe: every probe must run on the loop thread. This coroutine waits
+// (in band, by sleeping) until the holders have counted up to `target`, then checks that the
+// lock is fully released and reports through `result`/`probed`.
+Task<void> probe_lock_released(Scheduler* scheduler, Mutex& mtx, std::atomic<int>& counter, int target,
+                               std::atomic<size_t>& waiters, std::atomic<int>& result, std::atomic<bool>& probed)
+{
+    while (counter.load() < target)
+    {
+        co_await yyasio::sleep(scheduler, std::chrono::milliseconds(5));
+    }
+    waiters.store(mtx.waiter_count());
+    bool got = mtx.try_lock();
+    result.store(got ? 1 : 0);
+    if (got)
+    {
+        mtx.unlock();
+    }
+    probed.store(true);
+}
+
 BOOST_AUTO_TEST_CASE(test_mutex_uncontended)
 {
     // Nobody else holds the lock: lock() completes without suspending
@@ -1541,28 +1654,30 @@ BOOST_AUTO_TEST_CASE(test_mutex_uncontended)
     Mutex mtx;
     std::vector<int> order;
     std::atomic<int> done{0};
+    std::atomic<size_t> probed_waiters{999};
+    std::atomic<int> probed_result{0};
+    std::atomic<bool> probed{false};
 
-    // Same pattern as other IO tests: drive the coroutine before init(),
-    // it stops at the first IO and is resumed once run() submits it.
-    mutex_locked_incr(&scheduler, mtx, 10'000'000, 1, order, done).detach();
-
-    BOOST_CHECK(mtx.try_lock() == false); // still held inside the critical section
-    BOOST_CHECK_EQUAL(mtx.waiter_count(), 0u);
-
-    std::thread runner([&scheduler]() {
-        run_scheduler(scheduler);
+    std::thread runner([&]() {
+        run_scheduler(scheduler, [&]() {
+            mutex_locked_incr(&scheduler, mtx, 10'000'000, 1, order, done).detach();
+            // 还在 ring 线程上、且循环尚未启动：协程停在临界区里的那个 IO 上
+            BOOST_CHECK(mtx.try_lock() == false); // still held inside the critical section
+            BOOST_CHECK_EQUAL(mtx.waiter_count(), 0u);
+            probe_lock_released(&scheduler, mtx, done, 1, probed_waiters, probed_result, probed).detach();
+        });
     });
 
     auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
-    while (done.load() == 0 && std::chrono::steady_clock::now() < deadline) {
+    while ((done.load() == 0 || !probed.load()) && std::chrono::steady_clock::now() < deadline) {
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
     }
 
     BOOST_CHECK_EQUAL(done.load(), 1);
     BOOST_CHECK_EQUAL(order.size(), 1u);
     BOOST_CHECK_EQUAL(order[0], 1);
-    BOOST_CHECK(mtx.try_lock() == true); // released after unlock() with no waiters
-    mtx.unlock();
+    BOOST_CHECK_EQUAL(probed_result.load(), 1); // released after unlock() with no waiters
+    BOOST_CHECK_EQUAL(probed_waiters.load(), 0u);
     scheduler.stop();
     runner.join();
 }
@@ -1577,21 +1692,26 @@ BOOST_AUTO_TEST_CASE(test_mutex_fifo_order)
     Mutex mtx;
     std::vector<int> order;
     std::atomic<int> done{0};
+    std::atomic<size_t> probed_waiters{999};
+    std::atomic<int> probed_result{0};
+    std::atomic<bool> probed{false};
 
     long hold_ns = 100'000'000; // 100ms, holder 0 only
-    mutex_locked_incr(&scheduler, mtx, hold_ns, 0, order, done).detach();
-    BOOST_CHECK(mtx.try_lock() == false);
-    mutex_locked_incr(&scheduler, mtx, 0, 1, order, done).detach();
-    mutex_locked_incr(&scheduler, mtx, 0, 2, order, done).detach();
-    mutex_locked_incr(&scheduler, mtx, 0, 3, order, done).detach();
-    BOOST_CHECK_EQUAL(mtx.waiter_count(), 3u);
 
-    std::thread runner([&scheduler]() {
-        run_scheduler(scheduler);
+    std::thread runner([&]() {
+        run_scheduler(scheduler, [&]() {
+            mutex_locked_incr(&scheduler, mtx, hold_ns, 0, order, done).detach();
+            BOOST_CHECK(mtx.try_lock() == false);
+            mutex_locked_incr(&scheduler, mtx, 0, 1, order, done).detach();
+            mutex_locked_incr(&scheduler, mtx, 0, 2, order, done).detach();
+            mutex_locked_incr(&scheduler, mtx, 0, 3, order, done).detach();
+            BOOST_CHECK_EQUAL(mtx.waiter_count(), 3u);
+            probe_lock_released(&scheduler, mtx, done, 4, probed_waiters, probed_result, probed).detach();
+        });
     });
 
     auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
-    while (done.load() < 4 && std::chrono::steady_clock::now() < deadline) {
+    while ((done.load() < 4 || !probed.load()) && std::chrono::steady_clock::now() < deadline) {
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
     }
 
@@ -1601,7 +1721,7 @@ BOOST_AUTO_TEST_CASE(test_mutex_fifo_order)
     {
         BOOST_CHECK_EQUAL(order[i], i);
     }
-    BOOST_CHECK_EQUAL(mtx.waiter_count(), 0u);
+    BOOST_CHECK_EQUAL(probed_waiters.load(), 0u);
     scheduler.stop();
     runner.join();
 }
@@ -1614,24 +1734,27 @@ BOOST_AUTO_TEST_CASE(test_mutex_try_lock)
     Mutex mtx;
     std::vector<int> order;
     std::atomic<int> done{0};
+    std::atomic<size_t> probed_waiters{999};
+    std::atomic<int> probed_result{0};
+    std::atomic<bool> probed{false};
 
-    mutex_locked_incr(&scheduler, mtx, 50'000'000, 0, order, done).detach();
-
-    BOOST_CHECK(mtx.try_lock() == false);
-    BOOST_CHECK(mtx.try_lock() == false); // must stay false, no stealing
-
-    std::thread runner([&scheduler]() {
-        run_scheduler(scheduler);
+    std::thread runner([&]() {
+        run_scheduler(scheduler, [&]() {
+            mutex_locked_incr(&scheduler, mtx, 50'000'000, 0, order, done).detach();
+            BOOST_CHECK(mtx.try_lock() == false);
+            BOOST_CHECK(mtx.try_lock() == false); // must stay false, no stealing
+            // 持有者 50ms 后解锁，探测协程轮询到 done==1 再 try_lock
+            probe_lock_released(&scheduler, mtx, done, 1, probed_waiters, probed_result, probed).detach();
+        });
     });
 
     auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
-    while (done.load() == 0 && std::chrono::steady_clock::now() < deadline) {
+    while ((done.load() == 0 || !probed.load()) && std::chrono::steady_clock::now() < deadline) {
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
     }
 
     // After the holder unlocked, try_lock succeeds
-    BOOST_CHECK(mtx.try_lock() == true);
-    mtx.unlock();
+    BOOST_CHECK_EQUAL(probed_result.load(), 1);
     scheduler.stop();
     runner.join();
 }
@@ -1662,24 +1785,27 @@ BOOST_AUTO_TEST_CASE(test_mutex_lock_guard_scoped)
     Mutex mtx;
     std::vector<int> order;
     std::atomic<int> done{0};
+    std::atomic<size_t> probed_waiters{999};
+    std::atomic<int> probed_result{0};
+    std::atomic<bool> probed{false};
 
-    guard_locked_incr(&scheduler, mtx, 10'000'000, 1, order, done).detach();
-    BOOST_CHECK(mtx.try_lock() == false); // held inside the scope
-
-    std::thread runner([&scheduler]() {
-        run_scheduler(scheduler);
+    std::thread runner([&]() {
+        run_scheduler(scheduler, [&]() {
+            guard_locked_incr(&scheduler, mtx, 10'000'000, 1, order, done).detach();
+            BOOST_CHECK(mtx.try_lock() == false); // held inside the scope
+            probe_lock_released(&scheduler, mtx, done, 1, probed_waiters, probed_result, probed).detach();
+        });
     });
 
     auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
-    while (done.load() == 0 && std::chrono::steady_clock::now() < deadline) {
+    while ((done.load() == 0 || !probed.load()) && std::chrono::steady_clock::now() < deadline) {
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
     }
 
     BOOST_CHECK_EQUAL(done.load(), 1);
     BOOST_CHECK_EQUAL(order.size(), 1u);
     BOOST_CHECK_EQUAL(order[0], 1);
-    BOOST_CHECK(mtx.try_lock() == true); // released by ~LockGuard
-    mtx.unlock();
+    BOOST_CHECK_EQUAL(probed_result.load(), 1); // released by ~LockGuard
     scheduler.stop();
     runner.join();
 }
@@ -1695,19 +1821,25 @@ BOOST_AUTO_TEST_CASE(test_mutex_lock_guard_fifo)
     std::vector<int> order;
     std::atomic<int> done{0};
 
-    long hold_ns = 100'000'000; // 100ms, holder 0 only
-    guard_locked_incr(&scheduler, mtx, hold_ns, 0, order, done).detach();
-    guard_locked_incr(&scheduler, mtx, 0, 1, order, done).detach();
-    guard_locked_incr(&scheduler, mtx, 0, 2, order, done).detach();
-    guard_locked_incr(&scheduler, mtx, 0, 3, order, done).detach();
-    BOOST_CHECK_EQUAL(mtx.waiter_count(), 3u);
+    std::atomic<size_t> probed_waiters{999};
+    std::atomic<int> probed_result{0};
+    std::atomic<bool> probed{false};
 
-    std::thread runner([&scheduler]() {
-        run_scheduler(scheduler);
+    long hold_ns = 100'000'000; // 100ms, holder 0 only
+
+    std::thread runner([&]() {
+        run_scheduler(scheduler, [&]() {
+            guard_locked_incr(&scheduler, mtx, hold_ns, 0, order, done).detach();
+            guard_locked_incr(&scheduler, mtx, 0, 1, order, done).detach();
+            guard_locked_incr(&scheduler, mtx, 0, 2, order, done).detach();
+            guard_locked_incr(&scheduler, mtx, 0, 3, order, done).detach();
+            BOOST_CHECK_EQUAL(mtx.waiter_count(), 3u);
+            probe_lock_released(&scheduler, mtx, done, 4, probed_waiters, probed_result, probed).detach();
+        });
     });
 
     auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
-    while (done.load() < 4 && std::chrono::steady_clock::now() < deadline) {
+    while ((done.load() < 4 || !probed.load()) && std::chrono::steady_clock::now() < deadline) {
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
     }
 
@@ -1717,9 +1849,8 @@ BOOST_AUTO_TEST_CASE(test_mutex_lock_guard_fifo)
     {
         BOOST_CHECK_EQUAL(order[i], i);
     }
-    BOOST_CHECK_EQUAL(mtx.waiter_count(), 0u);
-    BOOST_CHECK(mtx.try_lock() == true); // fully released after last scope exit
-    mtx.unlock();
+    BOOST_CHECK_EQUAL(probed_waiters.load(), 0u);
+    BOOST_CHECK_EQUAL(probed_result.load(), 1); // fully released after last scope exit
     scheduler.stop();
     runner.join();
 }
@@ -1850,10 +1981,10 @@ BOOST_AUTO_TEST_CASE(test_task_move_only_result_async)
 
     std::unique_ptr<int> out;
     std::atomic<bool> done{false};
-    take_int_ptr_after_io(&scheduler, out, done).detach();
-
-    std::thread runner([&scheduler]() {
-        run_scheduler(scheduler);
+    std::thread runner([&]() {
+        run_scheduler(scheduler, [&]() {
+            take_int_ptr_after_io(&scheduler, out, done).detach();
+        });
     });
 
     auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
@@ -1899,10 +2030,10 @@ BOOST_AUTO_TEST_CASE(test_task_move_only_token_ownership)
     std::atomic<int> held_owners{-1};
     std::atomic<int> released_owners{-1};
     std::atomic<bool> done{false};
-    take_token_after_io(&scheduler, base, held_owners, released_owners, done).detach();
-
-    std::thread runner([&scheduler]() {
-        run_scheduler(scheduler);
+    std::thread runner([&]() {
+        run_scheduler(scheduler, [&]() {
+            take_token_after_io(&scheduler, base, held_owners, released_owners, done).detach();
+        });
     });
 
     auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
@@ -1960,10 +2091,10 @@ BOOST_AUTO_TEST_CASE(test_task_move_only_forward_nested)
     std::unique_ptr<std::string> out;
     std::atomic<bool> inner_checked{false};
     std::atomic<bool> done{false};
-    take_forwarded_ptr_coro(&scheduler, out, inner_checked, done).detach();
-
-    std::thread runner([&scheduler]() {
-        run_scheduler(scheduler);
+    std::thread runner([&]() {
+        run_scheduler(scheduler, [&]() {
+            take_forwarded_ptr_coro(&scheduler, out, inner_checked, done).detach();
+        });
     });
 
     auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
@@ -2195,11 +2326,11 @@ BOOST_AUTO_TEST_CASE(test_event_move_only_across_scheduler_coroutines)
     std::atomic<int> seen{0};
     std::atomic<bool> done{false};
 
-    consume_ptr_in_loop(&scheduler, event, seen, done).detach();
-    publish_ptr_after_io(&scheduler, event, MOVE_ONLY_MAGIC, published).detach();
-
-    std::thread runner([&scheduler]() {
-        run_scheduler(scheduler);
+    std::thread runner([&]() {
+        run_scheduler(scheduler, [&]() {
+            consume_ptr_in_loop(&scheduler, event, seen, done).detach();
+            publish_ptr_after_io(&scheduler, event, MOVE_ONLY_MAGIC, published).detach();
+        });
     });
 
     auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
@@ -2257,12 +2388,11 @@ BOOST_AUTO_TEST_CASE(test_timeout_event_fires_on_timeout)
     TimeoutWakeLog log;
     std::atomic<bool> done{false};
 
-    // 沿用本文件的约定：detach() 在启动 runner 线程之前完成，
-    // 于是 timer SQE 先停在 pending_queue 里，init/run 与协程同线程。
-    wait_timeout_once(&ev, log, done).detach();
-
-    std::thread runner([&scheduler]() {
-        run_scheduler(scheduler);
+    // init()、detach() 和 run() 都在 runner 线程上，见 run_scheduler() 的说明。
+    std::thread runner([&]() {
+        run_scheduler(scheduler, [&]() {
+            wait_timeout_once(&ev, log, done).detach();
+        });
     });
 
     auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
@@ -2304,13 +2434,13 @@ BOOST_AUTO_TEST_CASE(test_timeout_event_set_wins_and_timer_is_abandoned)
     TimeoutWakeLog log;
     std::atomic<bool> done{false};
 
-    // 两个协程都在 run() 之前挂起：waiter 已登记 _coro，setter 的 50ms 定时器与
+    // 两个协程都在同一个线程上启动：waiter 已登记 _coro，setter 的 50ms 定时器与
     // waiter 的 1200ms 定时器一起进 pending_queue，时序确定、没有竞态。
-    wait_until_set_arrives(&ev, log, done).detach();
-    set_after_50ms(&scheduler, &ev).detach();
-
-    std::thread runner([&scheduler]() {
-        run_scheduler(scheduler);
+    std::thread runner([&]() {
+        run_scheduler(scheduler, [&]() {
+            wait_until_set_arrives(&ev, log, done).detach();
+            set_after_50ms(&scheduler, &ev).detach();
+        });
     });
 
     auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
@@ -2354,10 +2484,10 @@ BOOST_AUTO_TEST_CASE(test_timeout_event_reusable_after_timeout)
     TimeoutWakeLog log;
     std::atomic<bool> done{false};
 
-    wait_timeout_three_times(&ev, log, done).detach();
-
-    std::thread runner([&scheduler]() {
-        run_scheduler(scheduler);
+    std::thread runner([&]() {
+        run_scheduler(scheduler, [&]() {
+            wait_timeout_three_times(&ev, log, done).detach();
+        });
     });
 
     auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
@@ -2400,11 +2530,11 @@ BOOST_AUTO_TEST_CASE(test_timeout_event_rearmable_after_abandon)
     TimeoutWakeLog log;
     std::atomic<bool> done{false};
 
-    wait_two_rounds_after_set(&ev, log, done).detach();
-    set_after_50ms(&scheduler, &ev).detach();
-
-    std::thread runner([&scheduler]() {
-        run_scheduler(scheduler);
+    std::thread runner([&]() {
+        run_scheduler(scheduler, [&]() {
+            wait_two_rounds_after_set(&ev, log, done).detach();
+            set_after_50ms(&scheduler, &ev).detach();
+        });
     });
 
     auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
@@ -2427,33 +2557,47 @@ BOOST_AUTO_TEST_CASE(test_timeout_event_rearmable_after_abandon)
 
 // ---------- 5. Scheduler 层：abandon 命中尚未提交的 pending item ----------
 
+// 在 ring 线程上直接 schedule() 一个 60s 定时器：此刻本轮 batch_prepare_sqe() 还没跑过它，
+// 它只会停在 pending_queue 里，所以紧接着的 abandon() 走的是 pending 分支（丢 item，
+// 不派 cancel SQE）。然后用一个正常 sleep 验证循环仍然工作：如果那条 60s 定时器被误提交，
+// run() 的退出条件（inflight_map 必须空）永不满足，本用例会卡在 5s deadline 上。
+Task<void> schedule_then_abandon_pending(Scheduler* scheduler, std::atomic<bool>& done)
+{
+    static struct __kernel_timespec long_ts { .tv_sec = 60, .tv_nsec = 0 };
+    uint64_t idx = 0;
+    int rc = scheduler->schedule(std::coroutine_handle<>{},
+                                [](io_uring_sqe* sqe) {
+                                    io_uring_prep_timeout(sqe, &long_ts, 0, 0);
+                                },
+                                nullptr, &idx);
+    BOOST_CHECK_EQUAL(rc, 0);
+
+    scheduler->abandon(idx);   // pending 分支：只把 token 记进 abandoned
+
+    int ret = co_await yyasio::sleep(scheduler, std::chrono::milliseconds(50));
+    BOOST_CHECK_EQUAL(ret, -ETIME);
+    done.store(true);
+}
+
 BOOST_AUTO_TEST_CASE(test_abandon_drops_pending_item_and_caller_resumes)
 {
     Scheduler scheduler;
-    TimeoutEvent ev(&scheduler);
-    TimeoutWakeLog log;
     std::atomic<bool> done{false};
 
-    // 注意此时还没有 init()/run()：协程挂起后它的 timer SQE 只停在 pending_queue 里，
-    // 于是 abandon() 走的是 pending 分支（丢弃 SQE、不发 cancel），resume 由调用方负责。
-    wait_until_set_arrives(&ev, log, done).detach();
-    BOOST_REQUIRE(!done.load());
-
-    ev.set();
-    BOOST_CHECK_EQUAL(log.times.load(), 1);
-    BOOST_CHECK(done.load());   // 协程被调用方 resume 后一路跑到销毁
-
-    // 现在才把循环启动起来：那个被丢弃的 item 不该被提交，也不该有任何 CQE 二次唤醒
-    std::thread runner([&scheduler]() {
-        run_scheduler(scheduler);
+    std::thread runner([&]() {
+        run_scheduler(scheduler, [&]() {
+            schedule_then_abandon_pending(&scheduler, done).detach();
+        });
     });
 
-    std::this_thread::sleep_for(std::chrono::milliseconds(300));
-    BOOST_CHECK_EQUAL(log.times.load(), 1);
+    auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (!done.load() && std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
 
+    BOOST_CHECK(done.load());
     scheduler.stop();
     runner.join();
-    BOOST_CHECK_EQUAL(log.times.load(), 1);
 }
 
 // ---------- 6. Scheduler 层：abandon 未知 index 是 no-op ----------
@@ -2468,7 +2612,7 @@ BOOST_AUTO_TEST_CASE(test_abandon_unknown_index_is_noop)
     scheduler.abandon(12345);
     scheduler.abandon(0);
 
-    // 队列/在飞表都是空的，循环靠 idle timeout 兜底，应能干净启停
+    // 队列/在飞表都是空的，循环由 stop() 经控制管道唤醒，应能干净启停
     std::thread runner([&scheduler]() {
         run_scheduler(scheduler);
     });

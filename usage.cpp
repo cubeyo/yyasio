@@ -1,6 +1,9 @@
 #include <cerrno>
+#include <dirent.h>
 #include <exception>
 #include <iostream>
+#include <string>
+#include <vector>
 #include <fcntl.h>
 #include <unistd.h>
 #include <netinet/in.h>
@@ -145,6 +148,75 @@ yyasio::Task<void> sleep_demo(yyasio::Scheduler* scheduler)
     co_await yyasio::sleep(scheduler, std::chrono::milliseconds(300));
 
     std::cout << "=== Sleep Demo done ===\n";
+}
+
+// 带外任务完成后把计数加到 shared 计数器上，用于展示“多个任务并发”
+yyasio::Task<void> rit_counted(yyasio::Scheduler* scheduler, int id, int sleep_ms,
+                               std::shared_ptr<std::atomic<int>> finished)
+{
+    auto [rc, got] = co_await yyasio::run_in_thread<int>(scheduler, [id, sleep_ms] {
+        ::usleep(static_cast<useconds_t>(sleep_ms) * 1000);   // 模拟一个必须阻塞的调用
+        return id;
+    });
+    std::cout << "  background job id=" << got << " rc=" << rc << "\n";
+    if (rc == 0 && got == id)
+    {
+        finished->fetch_add(1);
+    }
+}
+
+yyasio::Task<void> run_in_thread_demo(yyasio::Scheduler* scheduler)
+{
+    std::cout << "=== Run In Thread Demo ===\n";
+
+    // 1) 最基础用法：阻塞调用在普通线程上跑，结果由 co_await 带回来。
+    //    rc 是调度层状态：0 = 已执行；-ECANCELED = 调度器没接受（此时 val 是默认值）。
+    auto [rc1, text] = co_await yyasio::run_in_thread<std::string>(scheduler, [] {
+        ::usleep(200 * 1000);
+        return std::string("hello from a worker thread");
+    });
+    std::cout << "job1 rc = " << rc1 << ", value = \"" << text << "\"\n";
+
+    // 2) 结果可以是 move-only 类型（T 只需默认可构造 + 可移动构造 + 可移动赋值）
+    auto [rc2, ptr] = co_await yyasio::run_in_thread<std::unique_ptr<int>>(scheduler, [] {
+        return std::make_unique<int>(42);
+    });
+    std::cout << "job2 rc = " << rc2 << ", *ptr = " << (ptr ? *ptr : -1) << "\n";
+
+    // 3) 与 io_uring IO 并发：三个 200ms 的带外任务 + 本协程自己的 500ms 睡眠，
+    //    彼此不阻塞（三个都在 ring 线程之外等待，ring 线程全程不碰它们）
+    auto finished = std::make_shared<std::atomic<int>>(0);
+    for (int i = 0; i < 3; i++)
+    {
+        rit_counted(scheduler, i, 200, finished).detach();
+    }
+    int io_ret = co_await yyasio::sleep(scheduler, std::chrono::milliseconds(500));
+    std::cout << "job3 io sleep rc = " << io_ret << ", background jobs done = " << finished->load()
+              << "/3 (两者并发，不是串行)\n";
+
+    // 4) 这正是需要它的典型场景：io_uring 没有 getdents 操作，列目录只能阻塞调用，
+    //    于是丢给带外线程，协程照常等它的结果。
+    auto [rc4, entries] = co_await yyasio::run_in_thread<std::vector<std::string>>(scheduler, [] {
+        std::vector<std::string> names;
+        DIR* dir = opendir("/tmp");
+        if (dir)
+        {
+            while (dirent* de = readdir(dir))
+            {
+                names.emplace_back(de->d_name);
+            }
+            closedir(dir);
+        }
+        return names;
+    });
+    std::cout << "job4 rc = " << rc4 << ", /tmp has " << entries.size() << " entries";
+    if (!entries.empty())
+    {
+        std::cout << ", e.g. " << entries[0];
+    }
+    std::cout << "\n";
+
+    std::cout << "=== Run In Thread Demo done ===\n";
 }
 
 yyasio::Task<void> rename_file_demo(yyasio::Scheduler* scheduler)
@@ -687,6 +759,8 @@ int main()
 
     sleep_demo(&scheduler).detach();
 
+    run_in_thread_demo(&scheduler).detach();
+
     visit_regular_file(&scheduler).detach();
 
     get_coro_id(&scheduler).detach();
@@ -718,7 +792,6 @@ int main()
     // will block here
     scheduler.run();
 
-    // run() only returns on a fatal submit error (or if stop() was requested), and it
-    // must be paired with shutdown() on this very thread to release the ring.
-    scheduler.shutdown();
+    // run() returns after stop() is handled (or on a fatal submit error) and has already
+    // released the ring and the control pipe on this thread, so no extra cleanup call here.
 }

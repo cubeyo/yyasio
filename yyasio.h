@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cassert>
+#include <cerrno>
 #include <chrono>
 #include <limits>
 #include <cstdint>
@@ -9,9 +10,13 @@
 #include <iostream>
 #include <coroutine>
 #include <functional>
+#include <vector>
+#include <climits>
 #include <queue>
 #include <memory>
 #include <set>
+#include <unistd.h>
+#include <sys/poll.h>
 #include <sys/socket.h>
 #include <concepts>
 #include <unordered_map>
@@ -628,8 +633,11 @@ class Scheduler
 {
 public:
     ErrorCode init(size_t entries) {
-        if (initialized)
+        if (status != Uninitialized)
+        {
+            std::cerr << "Scheduler already initialized" << std::endl;
             return YYASIO_INIT_ERROR;
+        }
 
         // These two flags are supported by kernel >= 6.0
         if (io_uring_queue_init(entries, &ring, IORING_SETUP_SINGLE_ISSUER|IORING_SETUP_DEFER_TASKRUN) < 0 &&
@@ -638,7 +646,11 @@ public:
             return YYASIO_INIT_ERROR;
         }
 
-        initialized = true;
+        if (!init_control_pipe())
+        {
+            io_uring_queue_exit(&ring);
+            return YYASIO_INIT_ERROR;
+        }
 
         // io_uring is set up SINGLE_ISSUER: only this thread may submit. The plain
         // containers below (pending_queue/inflight_map/abandoned) are not thread-safe
@@ -646,25 +658,32 @@ public:
         // A value-initialized std::thread::id denotes no thread at all, so it doubles
         // as the "no owner recorded yet" sentinel.
         ring_owner.store(std::this_thread::get_id(), std::memory_order_release);
+
+        status = Initialized;
+
         return YYASIO_OK;
     }
 
-    // this function should be called in same thread which calls run()
-    void shutdown() {
-        if (initialized)
-        {
-            io_uring_queue_exit(&ring);
-            // Clear the flag: a second io_uring_queue_exit() would unregister and
-            // munmap using the stale ring pointers, so allow at most one per init().
-            initialized = false;
-        }
+    bool is_accepting_io()
+    {
+        assert (is_on_ring_thread() && "Scheduler::is_accepting_io() must run on the init()/run() thread");
+        return status == Running || status == Initialized;
     }
 
-    uint64_t schedule(std::coroutine_handle<> coro, PrepSqeClosure prep_seq_fn, int* presult)
+    int schedule(std::coroutine_handle<> coro, PrepSqeClosure prep_seq_fn, int* presult, std::uint64_t* index = nullptr)
     {
-        assert(on_ring_thread() && "Scheduler::schedule() must run on the init()/run() thread");
+        assert(is_on_ring_thread() && "Scheduler::schedule() must run on the init()/run() thread");
+        if (!is_accepting_io()) [[unlikely]]
+        {
+            std::cerr << "Scheduler not running" << std::endl;
+            return -ECANCELED;
+        }
+
         debug_coro("schedule coro:", coro);
-        return append_pending_queue(coro, prep_seq_fn, presult);
+        uint64_t cancel_index = append_pending_queue(coro, prep_seq_fn, presult);
+        if (index)
+            *index = cancel_index;
+        return 0;
     }
 
     // Calling abandon means the caller does not care about the io result and will 
@@ -675,7 +694,7 @@ public:
     // (from hardware thread which calls scheduler.run())
     void abandon(uint64_t index)
     {
-        assert(on_ring_thread() && "Scheduler::abandon() must run on the init()/run() thread");
+        assert(is_on_ring_thread() && "Scheduler::abandon() must run on the init()/run() thread");
         bool io_is_pending = !pending_queue.empty() && index >= pending_queue.front().index && index <= pending_queue.back().index;
         bool io_is_inflight = inflight_map.contains(index);
         if (!io_is_pending && !io_is_inflight)
@@ -698,113 +717,82 @@ public:
         abandoned.insert(index);
     }
 
-    // Request the loop to return. stop() may be called from another thread (that is
-    // how the unit tests shut a scheduler down), hence the atomic flag. Note that it
-    // only makes the request visible: run() re-checks it once per iteration, so the
-    // loop returns when the next completion arrives. Do not reach for the ring from
-    // here to force that wakeup -- it is set up SINGLE_ISSUER, only the thread that
-    // runs it may touch it.
-    void stop() { stopped.store(true, std::memory_order_release); }
+    // stop can be called from external thread
+    void stop()
+    { 
+        ::write(control_pipe[1], &kStopTicket, sizeof(kStopTicket));
+    }
 
-public:
     void run()
     {
         // Until init() succeeded the ring is zero-initialized, so every liburing call
         // below would dereference NULL ring pages and crash. Refuse to start instead.
-        if (!initialized) [[unlikely]]
+        if (status != Initialized)
         {
             std::cerr << "Scheduler::run() called without a successful init()\n";
             return;
         }
 
-        assert(on_ring_thread() && "Scheduler::run() must be called on the init() thread (SINGLE_ISSUER)");
+        assert(is_on_ring_thread() && "Scheduler::run() must be called on the init() thread (SINGLE_ISSUER)");
 
-        constexpr uint64_t MAGIC_IDLE_TIMEOUT = 0xFFFFFFFFFFFFFF00ULL;
-        constexpr struct __kernel_timespec idle_ts {0, 1000000};
-        while (!stopped.load(std::memory_order_acquire))
+        status = Running;
+        while (true)
         {
-            batch_prepare_sqe();
-
-            /* In single thread program, when reached here,
-             * there is at least one coroutine waiting IO
-             * inflight should not be empty.
-             * We add this to allow test program to stop
-             * scheduler gentally.
-             */
-            if (inflight_map.empty()) [[unlikely]]
-            {
-                auto* sqe = io_uring_get_sqe(&ring);
-                if (sqe)
-                {
-                    memset(sqe, 0, sizeof(*sqe));
-                    io_uring_prep_timeout(sqe, &idle_ts, 0, 0);
-                    io_uring_sqe_set_data64(sqe, MAGIC_IDLE_TIMEOUT);
-                }
-            }
-
-            int submitted = 0;
-            do {
-                submitted = io_uring_submit_and_wait(&ring, 1);
-                if (submitted < 0) [[unlikely]]
-                {
-                    if (submitted == -EINTR || submitted == -EAGAIN)
-                    {
-                        continue;
-                    }
-                    std::cerr << "io_uring_submit_and_wait failed:, ret = " << submitted << "\n";
-                    return;
-                }
+            if (!run_once()) [[unlikely]]
                 break;
-            } while (true);
+            if (status != Running && 
+                pending_queue.empty() && 
+                inflight_map.empty() &&
+                coros_waiting_for_extern_wakeup.empty()) [[unlikely]]
+                break;
+        }
 
-            tot_submit_items += submitted;
-            tot_submit_count += 1;
+        do_recycle();
+    }
 
-            io_uring_cqe* cqe = nullptr;
-            while (io_uring_peek_cqe(&ring, &cqe) == 0)
+    void do_stop()
+    {
+        status = Stopping;
+    }
+
+    // register a coro waiting for a external wakeup
+    int register_coro_waiting_extern(std::coroutine_handle<> coro, std::uint64_t* ticket)
+    {
+        assert(is_on_ring_thread() && "Scheduler::register_coro_waiting_for_thread() must be called on the init() thread (SINGLE_ISSUER)");
+
+        if (!is_accepting_io())
+        {
+            return -ECANCELED;
+        }
+        auto index = wakeup_tickets++;
+        coros_waiting_for_extern_wakeup[index] = coro;
+        *ticket = index;
+        return 0;
+    }
+
+    // This function is called from the external worker thread
+    void wakeup_coro_by_ticket(std::uint64_t ticket)
+    {
+        // from man 7 pipe:
+        // POSIX.1 says that write(2)s of less than PIPE_BUF bytes must be atomic:
+        // the output data is written to the pipe as a contiguous sequence.
+        static_assert(sizeof(std::uint64_t) < PIPE_BUF);
+        while (true)
+        {
+            ssize_t ret = ::write(control_pipe[1], &ticket, sizeof(std::uint64_t));
+            
+            if (ret == (ssize_t)sizeof(ticket))
+                return;
+
+            if (ret < 0 && errno == EAGAIN)
             {
-                auto inflight_idx = io_uring_cqe_get_data64(cqe);
-                if (inflight_idx == MAGIC_IDLE_TIMEOUT) [[unlikely]]
-                {
-                    io_uring_cqe_seen(&ring, cqe);
-                    continue;
-                }
-                int cqe_res = cqe->res;
-                io_uring_cqe_seen(&ring, cqe);
-
-                auto iter = inflight_map.find(inflight_idx);
-                if (iter == inflight_map.end()) [[unlikely]]
-                {
-                    std::cerr << "duplicate cqe for index = " << inflight_idx << "\n";
-                    // Duplicate CQE: the SQE already completed and the coroutine may
-                    // have been resumed/destroyed. Skip this CQE and continue
-                    // processing the remaining ones.
-                    continue;
-                }
-
-                auto [coro_addr, res_addr] = iter->second;
-                uint64_t index = iter->first;
-                inflight_map.erase(iter);
-                if (check_abandoned_and_erase(index))
-                {
-                    continue;
-                }
-                // empty coroutine address means this IO is emitted by
-                // scheduler itself, no coroutine need to be continued
-                if (!coro_addr)
-                {
-                    continue;
-                }
-
-                auto handle = std::coroutine_handle<>::from_address(reinterpret_cast<void*>(coro_addr));
-                debug_coro("io returned:", handle);
-                if (res_addr) [[likely]]
-                {
-                    *res_addr = cqe_res;
-                }
-
-                handle.resume();
+                std::this_thread::sleep_for(std::chrono::microseconds(10));
+                continue;
             }
+
+            int e = errno;
+            std::cerr << "notify write failed errno = " << e << "\n";
+            std::terminate();
         }
     }
 
@@ -823,10 +811,156 @@ public:
     }
 
 private:
+    void handle_cqe(io_uring_cqe* cqe)
+    {
+        auto inflight_idx = io_uring_cqe_get_data64(cqe);
+        if (inflight_idx == kUserDataControlPipe) [[unlikely]]
+        {
+            bool more = cqe->flags & IORING_CQE_F_MORE;
+            int cqe_res = cqe->res;
+            io_uring_cqe_seen(&ring, cqe);
+            on_control_pipe_received();
+
+            // if control_pipe[1] closed unexpectedly, polling pipe[0] will get POLLHUP
+            // just print message as hint
+            if (cqe_res & (POLLHUP | POLLERR | POLLNVAL))
+                std::cerr << "control pipe got POLLHUP/ERR, stop() may never take effect\n";
+
+            if (!more)
+            {
+                control_pipe_armed = false;
+                std::cerr << "control pipe terminated unexpectedly, res=" << cqe_res << std::endl;
+            }
+            return;
+        }
+
+        int cqe_res = cqe->res;
+        io_uring_cqe_seen(&ring, cqe);
+        on_inflight_io_returned(inflight_idx, cqe_res);
+    }
+
+    bool run_once()
+    {
+        batch_prepare_sqe();
+
+        int submitted = submit_sqe();
+        if (submitted < 0)
+        {
+            return false;
+        }
+
+        tot_submit_items += submitted;
+        tot_submit_count += 1;
+
+        size_t cqe_cnt = 0;
+        io_uring_cqe* cqe = nullptr;
+        while (io_uring_peek_cqe(&ring, &cqe) == 0)
+        {
+            cqe_cnt++;
+            handle_cqe(cqe);
+        }
+
+        // cqe_cnt == 0 means we did nothing in the loop,
+        // not adding any new items to pending queue, so
+        // there is no work to do, just block on wait_cqe.
+        if (cqe_cnt == 0)
+        {
+            int ret = io_uring_wait_cqe(&ring, &cqe);
+            if (ret < 0)
+            {
+                std::cerr << "io_uring_wait_cqe failed:, ret = " << ret << "\n";
+                std::terminate();
+            }
+            handle_cqe(cqe);
+        }
+
+        return true;
+    }
+
+    int submit_sqe()
+    {
+        int submitted = 0;
+        while(true)
+        {
+            submitted = io_uring_submit_and_wait(&ring, 1);
+            if (submitted >= 0) [[likely]]
+                return submitted;
+            if (submitted == -EINTR || submitted == -EAGAIN)
+            {
+                continue;
+            }
+            std::cerr << "io_uring_submit_and_wait failed:, ret = " << submitted << "\n";
+            return submitted;
+        }
+    }
+
+    void on_ticket_received(uint64_t ticket)
+    {
+        if (ticket == kStopTicket)
+        {
+            do_stop();
+            return;
+        }
+
+        // the ticket is sent by external worker thread, and maybe untrustworthy
+        // just ignore it if invalid, instead of assert it
+        auto iter = coros_waiting_for_extern_wakeup.find(ticket);
+        if (iter == coros_waiting_for_extern_wakeup.end())
+        {
+            std::cerr << "WARNING: no coro waiting for thread finish with ticket " << ticket << "\n";
+            return;
+        }
+        auto coro = iter->second;
+        coros_waiting_for_extern_wakeup.erase(iter);
+        coro.resume();
+    }
+
+    void on_inflight_io_returned(uint64_t index, int res)
+    {
+        auto iter = inflight_map.find(index);
+        if (iter == inflight_map.end()) [[unlikely]]
+        {
+            std::cerr << "duplicate cqe for index = " << index << "\n";
+            // Duplicate CQE: the SQE already completed and the coroutine may
+            // have been resumed/destroyed. Skip this CQE and continue
+            // processing the remaining ones.
+            return;
+        }
+
+        auto [coro_addr, res_addr] = iter->second;
+        inflight_map.erase(iter);
+        if (check_abandoned_and_erase(index))
+        {
+            // the inflight io is abandoned, scheduler need not resume it
+            return;
+        }
+
+        // Empty coroutine address means this IO is emitted by
+        // scheduler itself, no coroutine need to be continued
+        if (!coro_addr)
+        {
+            return;
+        }
+
+        auto handle = std::coroutine_handle<>::from_address(reinterpret_cast<void*>(coro_addr));
+        debug_coro("io returned:", handle);
+        if (res_addr) [[likely]]
+        {
+            *res_addr = res;
+        }
+
+        handle.resume();
+    }
+
     void batch_prepare_sqe()
     {
         tot_pending_queue_size += pending_queue.size();
         tot_pending_queue_sample_count += 1;
+
+        if (!control_pipe_armed)
+        {
+            control_pipe_armed = do_prep_control_pipe_sqe();
+        }
 
         while (!pending_queue.empty())
         {
@@ -885,10 +1019,87 @@ private:
         return ret;
     }
 
-    bool on_ring_thread() const noexcept
+    bool is_on_ring_thread() const noexcept
     {
         auto owner = ring_owner.load(std::memory_order_acquire);
         return owner == std::thread::id {} || owner == std::this_thread::get_id();
+    }
+
+    void on_control_pipe_received()
+    {
+        uint64_t buf[32];
+        std::vector<uint64_t> ready_tickets;
+        // io uring cqe for poll multishot is edge-triggered,
+        // need to read all available data
+        while (true)
+        {
+            // control_pipe is created with O_NONBLOCK, so read may return EAGAIN
+            // when no data available
+            ssize_t n = ::read(control_pipe[0], buf, sizeof(buf));
+            if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK))
+            {
+                break;
+            }
+            if (n < 0)
+            {
+                int e = errno;
+                std::cerr << "WARNING: read from control_pipe failed: " << strerror(e) << "\n";
+                // some coroutine may forever block waiting for the pipe, terminate is better
+                std::terminate();
+            }
+            if (n == 0)
+                break;
+            assert (n % (ssize_t)sizeof(uint64_t) == 0);
+            for (ssize_t i = 0; i < n / (ssize_t)sizeof(uint64_t); i++)
+                ready_tickets.push_back(buf[i]);
+        }
+        for (auto ticket : ready_tickets)
+        {
+            on_ticket_received(ticket);
+        }
+    }
+
+    bool do_prep_control_pipe_sqe()
+    {
+        auto* sqe = io_uring_get_sqe(&ring);
+        if (!sqe)
+        {
+            return false;
+        }
+        memset(sqe, 0, sizeof(*sqe));
+        io_uring_sqe_set_data64(sqe, kUserDataControlPipe);
+        io_uring_prep_poll_multishot(sqe, control_pipe[0], POLLIN);
+        return true;
+    }
+
+    bool init_control_pipe()
+    {        
+        if (pipe2(control_pipe, O_CLOEXEC | O_NONBLOCK) < 0)
+        {
+            return false;
+        }
+
+        control_pipe_armed = do_prep_control_pipe_sqe();
+        if (!control_pipe_armed)
+        {
+            ::close(control_pipe[0]);
+            ::close(control_pipe[1]);
+            return false;
+        }
+
+        return true;
+    }
+
+    // recycle all resouces
+    void do_recycle()
+    {
+        assert (is_on_ring_thread() && "Scheduler::do_recycle() must run on the init()/run() thread");
+        io_uring_queue_exit(&ring);
+        close(control_pipe[0]);
+        close(control_pipe[1]);
+        control_pipe[0] = -1;
+        control_pipe[1] = -1;
+        status = Uninitialized;
     }
 
     io_uring ring {};
@@ -911,7 +1122,46 @@ private:
     };
     std::unordered_map<uint64_t, InflightItem> inflight_map; // io_idx -> <coro addr, result addr>
 
-    std::atomic<bool> stopped{false};
+    // The control pipe is used to communicate between in-band coroutines
+    // and out-of-band workers.
+    // In-band coroutines: coroutines spawned by the scheduler and run in
+    // single-thread mode.
+    // Out-of-band(OOB) workers: they run in thread different from the
+    // in-band thread. They can not visit/control the scheduler directly
+    // and need to communicate with the scheduler through the control pipe.
+    // By sending a uint64 byte to control_pipe[1], an OOB worker can notify
+    // the scheduler to resume some coroutine or perform some specific actions.
+    int control_pipe[2] {-1, -1};
+    bool control_pipe_armed = false;
+
+
+    // Any in-band coroutine can register itself to wait for external signals.
+    // After calling register_coro_waiting_extern, the caller will get a ticket
+    // of type uint64, which can be handled to an external thread. If the extern
+    // thread need to wakeup the coro, it only need to write this ticket to 
+    // control_pipe[1], and the scheduler will resume the coro.
+    // The scheduler is NOT responsible for passing return values. Values may be
+    // passed by shared objects.
+    std::unordered_map<uint64_t, std::coroutine_handle<>> coros_waiting_for_extern_wakeup;
+    uint64_t wakeup_tickets = 0;
+    
+    // special ticket for control purpose
+    static constexpr uint64_t kStopTicket = std::numeric_limits<uint64_t>::max() - 1;
+
+    static constexpr __kernel_timespec kIdleTs {0, 1000000};
+    // Some magic user data values to distinguish cqe for different purposes
+    // They must be large enough to avoid conflict with other user trigger operations,
+    // which carries user data values counted from 0
+    static constexpr uint64_t kUserDataControlPipe = std::numeric_limits<uint64_t>::max() - 1;
+
+    enum {
+        Uninitialized,
+        Initialized,
+        Running,
+        Stopping,
+        Stopped
+    } status = Uninitialized;
+
     // Thread that owns the ring, recorded by init(); value-initialized means "nobody yet".
     std::atomic<std::thread::id> ring_owner {};
     uint64_t tot_sched_time = 0;
@@ -920,9 +1170,15 @@ private:
     uint64_t tot_submit_count = 0;
     uint64_t tot_pending_queue_size = 0;
     uint64_t tot_pending_queue_sample_count = 0;
-    bool initialized = false;
 };
 
+
+// CAUTION: Users of TimeoutEvent should check the result
+// of wait_until: int ret = co_await event.wait_until(...)
+// Returning any negative value means the scheduler is not
+// working properly, the co_await is resumed immediately,
+// The TimeoutEvent has not got a set() or a timeout signal
+// before coroutine continues.
 class TimeoutEvent
 {
 public:
@@ -944,20 +1200,31 @@ public:
                 io_uring_prep_timeout(sqe, ts, 0, 0);
             };
             assert (_event->_cancel_index == std::numeric_limits<uint64_t>::max());
-            _event->_cancel_index = _scheduler->schedule(coro, prepare_sqe_cb, nullptr);
+            int ret = _scheduler->schedule(coro, prepare_sqe_cb, nullptr, &_event->_cancel_index);
+    
+            // nagtive return means scheduler has not schedule anything
+            // we can not expect scheduler to wakeup this coroutine in future
+            // so just return false to continue coroutine
+            if (ret < 0) [[unlikely]]
+            {
+                _result = ret;
+                return false;
+            }
             return true;
         }
 
-        void await_resume() const
+        int await_resume() const
         {
             _event->_cancel_index = std::numeric_limits<uint64_t>::max();
             _event->_coro = nullptr;
             _event->_pending = false;
+            return _result;
         }
 
         Scheduler* _scheduler;
         struct __kernel_timespec* _time_spec;
         TimeoutEvent* _event;
+        int _result = 0;
     };
 
 public:
@@ -1018,27 +1285,35 @@ public:
     // value, since the caller has to destroy the temporary it materializes.)
     ~UringAwaiter()
     {
-        debug_coro("awaiter destroyed by coro:", coro_handle);
+        debug_coro("awaiter destroyed by coro:", _coro);
     }
 
-    bool await_ready() const noexcept { return false; }
-    bool await_suspend(std::coroutine_handle<> handle) noexcept
+    bool await_ready() const noexcept
     {
-        coro_handle = handle;
-        scheduler->schedule(handle, _prepare_sqe_fn, &result);
+        return false;
+    }
+    bool await_suspend(std::coroutine_handle<> coro) noexcept
+    {
+        _coro = coro;
+        int ret = scheduler->schedule(coro, _prepare_sqe_fn, &result);
+        if (ret < 0)
+        {
+            result = ret;
+            return false;
+        }
         return true;
     }
 
     int await_resume() const noexcept
     {
-        debug_coro("await_resume for coro:", coro_handle);
+        debug_coro("await_resume for coro:", _coro);
         return result;
     }
 
 private:
     Scheduler* scheduler = nullptr;
     PrepSqeClosure _prepare_sqe_fn;
-    std::coroutine_handle<> coro_handle{};
+    std::coroutine_handle<> _coro{};
     int result = 0;
 };
 
@@ -1209,5 +1484,54 @@ inline SleepAwaiter<Rep, Period> sleep(Scheduler* scheduler, std::chrono::durati
 {
     return SleepAwaiter<Rep, Period>(scheduler, duration, 0, 0);
 }
+
+template <typename T>
+class ThreadAwaiter
+{
+    static_assert(std::is_default_constructible_v<T>, "T must be default constructible");
+    static_assert(std::is_move_constructible_v<T>, "T must be move constructible");
+    static_assert(std::is_move_assignable_v<T>, "T must be move assignable");
+
+public:
+    explicit ThreadAwaiter(Scheduler* scheduler, std::function<T()> func)
+    : _scheduler(scheduler), _func(std::move(func)) {}
+
+    bool await_ready() const noexcept { return false; }
+    bool await_suspend(std::coroutine_handle<> coro) noexcept
+    {
+        std::uint64_t ticket = 0;
+        ret = _scheduler->register_coro_waiting_extern(coro, &ticket);
+        if (ret < 0)
+        {
+            return false;
+        }
+        _thread = std::thread([this, ticket] {
+            result = _func();
+            _scheduler->wakeup_coro_by_ticket(ticket);
+        });
+        return true;
+    }
+
+    std::tuple<int, T> await_resume() noexcept
+    {
+        if (_thread.joinable())
+            _thread.join();
+        return {ret, std::move(result)};
+    }
+
+private:
+    Scheduler* _scheduler;
+    T result {};
+    int ret = 0;
+    std::thread _thread {};
+    std::function<T()> _func;
+};
+
+template <typename T, typename F>
+inline ThreadAwaiter<T> run_in_thread(Scheduler* s, F&& f)
+{
+    return ThreadAwaiter<T>(s, std::function<T()>(std::forward<F>(f)));
+}
+
 
 } // namespace yyasio
