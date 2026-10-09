@@ -7,7 +7,7 @@
 ## 特性
 
 - **Header-only**：单个头文件 `yyasio.h`，拷贝即用。
-- **io_uring 封装**：`read` / `write` / `sync_file_range` / `openat` / `close` / `accept` / `connect` / `listen` / `timeout` / `renameat` / `unlinkat` / `mkdirat` / `statx` / `cancel_fd` 等常用操作的异步 awaiter。
+- **io_uring 封装**：`read` / `write` / `sync_file_range` / `openat` / `close` / `accept` / `connect` / `listen` / `timeout` / `sleep` / `renameat` / `unlinkat` / `mkdirat` / `statx` / `cancel_fd` 等常用操作的异步 awaiter。
 - **C++20 协程支持**：`Task<T>` / `Task<void>`，支持 `co_await` 组合与 `detach()` 的 fire-and-forget 用法。
 - **单线程事件循环**：`Scheduler` 以单线程驱动 io_uring，模型简单、无锁竞争。
 - **协程调试能力**（编译期开关）：异常时打印硬件栈回溯与协程调用链、协程生命周期日志。
@@ -21,6 +21,7 @@
 |---|---|---|
 | 操作系统 | Linux 内核 **5.11+** | io_uring 基础操作 |
 | 内核 5.6+ | `statx` | 依赖 `IORING_OP_STATX`；早于本库 5.11 基线，故无额外要求 |
+| 内核 5.4+ | `timeout` / `sleep` | 依赖 `IORING_OP_TIMEOUT`；早于本库 5.11 基线，故无额外要求 |
 | 内核 **5.15+** | `mkdirat` | 依赖 `IORING_OP_MKDIRAT`（`renameat` / `unlinkat` 只需 5.11） |
 | 内核 5.19+ | `cancel_fd` | 异步取消（`IORING_ASYNC_CANCEL_FD`） |
 | 内核 **5.5+** | `TimeoutEvent` / `abandon()` | 依赖 `IORING_OP_ASYNC_CANCEL` 按 `user_data` 取消（`flags = 0`）；`IORING_ASYNC_CANCEL_*` 匹配标志需更新内核，本库当前未使用 |
@@ -208,6 +209,27 @@ yyasio::Task<void> statx_demo(yyasio::Scheduler* scheduler) {
 
 `statxbuf` 与 `path` 都是指针捕获，内核要到 CQE 回来时才写缓冲，所以两者必须存活到操作完成——放在协程帧内的局部变量即可。完整流程（含不存在路径的 `-ENOENT`）见 [`usage.cpp`](./usage.cpp) 的 `statx_demo`。
 
+### 定时睡眠（sleep）
+
+`co_await yyasio::sleep(scheduler, 1500ms)` 挂起当前协程、到点再回来，接受任意 `std::chrono::duration`：
+
+```cpp
+yyasio::Task<void> nap(yyasio::Scheduler* scheduler) {
+    co_await yyasio::sleep(scheduler, std::chrono::milliseconds(100));
+    co_await yyasio::sleep(scheduler, std::chrono::seconds(2));
+    co_await yyasio::sleep(scheduler, std::chrono::milliseconds(-50)); // 负值钳制成 0，立即到期
+}
+```
+
+与 `timeout(sched, ts, count, flags)` 的区别在于 timespec 归属：`timeout` 只转传你给的指针，该内存必须活到操作完成；`sleep` 把 timespec 放在自己的 awaiter 内（awaiter 分配在协程帧里，活到 `await_resume()` 之后），调用方不需要操心。
+
+两条语义约定：
+
+- **睡满返回 `-ETIME`，不是 `0`**。这是 io_uring 定时器的报法（到期 `-ETIME`，被取消 `-ECANCELED`，只有靠完成事件凑够 `count` 才返回 `0`），与下文第 8 条一致，不要把 `< 0` 当失败分支。
+- **计时用 `CLOCK_MONOTONIC`**，不含系统挂起时间；需要 `BOOTTIME` / `REALTIME` / 绝对时刻 / 事件计数时请直接用底层 `timeout`。
+
+完整演示（各时长实测耗时 + 三路并发睡眠）见 [`usage.cpp`](./usage.cpp) 的 `sleep_demo`，回归用例见 [`yyasio_unittest.cpp`](./yyasio_unittest.cpp) 的 `test_sleep_*`。
+
 ### 可用异步 API
 
 均为返回 awaiter 的自由函数，`co_await` 后得到 `int` 结果（io_uring 风格：成功为返回值，失败为 `-errno`）：
@@ -222,7 +244,8 @@ yyasio::Task<void> statx_demo(yyasio::Scheduler* scheduler) {
 | `accept(sched, listen_fd, addr, len, flags)` | 接受连接 |
 | `connect(sched, fd, addr, len)` | 发起连接 |
 | `listen(sched, fd, backlog=SOMAXCONN)` | 监听（io_uring 原生支持） |
-| `timeout(sched, ts, count=0, flags=0)` | 定时器 |
+| `timeout(sched, ts, count=0, flags=0)` | 定时器；`ts` 为指针捕获，需存活到操作完成 |
+| `sleep(sched, duration)` | 定时睡眠，接受任意 `std::chrono::duration`；timespec 由 awaiter 自持；睡满返回 `-ETIME`，负值按 `0` 处理 |
 | `renameat(sched, olddirfd, old, newdirfd, new, flags=0)` | 重命名（文件与目录同用，对应 `renameat2`） |
 | `unlinkat(sched, dirfd, path, flags=0)` | 删除；删目录传 `flags = AT_REMOVEDIR`，且目录必须已空 |
 | `mkdirat(sched, dirfd, path, mode=0755)` | 创建目录，`mode` 受进程 umask 过滤（需内核 5.15+） |
@@ -270,13 +293,13 @@ yyasio::Task<void> statx_demo(yyasio::Scheduler* scheduler) {
    协程体内抛出未捕获异常时，`unhandled_exception()` 会打印栈回溯（若开启宏）后调用 `std::terminate()`，**不做异常跨协程传播**。请在协程内自行 `try/catch`。
 
 6. **awaiter 参数与缓冲区生命周期**
-   awaiter 以指针/引用捕获参数（如 `timeout` 的 `__kernel_timespec*`、`read/write` 的 `buffer`、`statx` 的 `struct statx*` 与 `path`）。在 kernel ≤ 5.9 上 `timeout` 的时间结构体须在操作完成前保持有效；缓冲区须在 IO 完成前存活。建议放在协程帧内的局部变量，跨 `co_await` 保持。
+   awaiter 以指针/引用捕获参数（如 `timeout` 的 `__kernel_timespec*`、`read/write` 的 `buffer`、`statx` 的 `struct statx*` 与 `path`）。在 kernel ≤ 5.9 上 `timeout` 的时间结构体须在操作完成前保持有效；缓冲区须在 IO 完成前存活。建议放在协程帧内的局部变量，跨 `co_await` 保持。例外：`sleep` 自己持有 timespec，无需调用方保留。
 
 7. **offset 语义**
    `read` / `write` 默认 `offset = 0`，即以文件起始位置作为绝对偏移（io_uring `prep_read/write` 语义），并非从当前游标追加。需要追加写时显式传入 `offset`。
 
 8. **返回值错误码**
-   异步 API 返回 io_uring 风格结果：`>=0` 为成功，`<0` 为 `-errno`（如 `timeout` 到期返回 `-ETIME`）。
+   异步 API 返回 io_uring 风格结果：`>=0` 为成功，`<0` 为 `-errno`（如 `timeout` / `sleep` 到期返回 `-ETIME`）。
 
 9. **依赖工具链**
    header-only 但依赖 `liburing`（及开启调试宏时的 `libunwind`）；单元测试依赖 Boost.Test。低版本 liburing（< 2.3）下 `cancel_fd` 走手工填充 SQE 的兼容路径，需 kernel ≥ 5.19。

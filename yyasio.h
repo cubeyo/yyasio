@@ -20,6 +20,7 @@
 #include <atomic>
 #include <thread>
 #include <utility>
+#include <type_traits>
 
 #ifndef PRINT_STACK_ON_EXCEPTION
 #define PRINT_STACK_ON_EXCEPTION 0
@@ -1010,6 +1011,11 @@ public:
     UringAwaiter(UringAwaiter&&) = delete;
     UringAwaiter& operator=(UringAwaiter&&) = delete;
 
+    // Non-virtual on purpose: an awaiter is only ever built as the co_await temporary
+    // inside the awaiting coroutine's own scope and destroyed there after await_resume(),
+    // so nothing deletes it through a UringAwaiter*. (Making this protected/private is not
+    // an option either -- it would break every free function that returns an awaiter by
+    // value, since the caller has to destroy the temporary it materializes.)
     ~UringAwaiter()
     {
         debug_coro("awaiter destroyed by coro:", coro_handle);
@@ -1159,6 +1165,49 @@ inline UringAwaiter statx(Scheduler* scheduler, int dfd, const char* path, struc
         io_uring_prep_statx(sqe, dfd, path, flags, mask, statxbuf);
     };
     return UringAwaiter{ scheduler, prepare_sqe_cb };
+}
+
+template <typename Rep, typename Period>
+class SleepAwaiter : public UringAwaiter
+{
+    // The prepare-SQE closure below captures `this`, and the SQE carries &_timespec, so this
+    // awaiter must stay exactly where the co_await expression built it (in the coroutine
+    // frame) until the operation completes. UringAwaiter's deleted copy/move ctors are what
+    // guarantees that; if they ever get relaxed, the kernel would read the timespec out of a
+    // stale object, so make that a compile error instead of silent UB.
+    static_assert(!std::is_copy_constructible_v<UringAwaiter> && !std::is_move_constructible_v<UringAwaiter>,
+                  "UringAwaiter must stay non-copyable and non-movable: SleepAwaiter hands the kernel a pointer into itself");
+
+public:
+    SleepAwaiter(Scheduler* scheduler, std::chrono::duration<Rep, Period> duration, unsigned int count, unsigned int flags)
+    : UringAwaiter(scheduler, [this](io_uring_sqe* sqe) { prepare_sqe(sqe);})
+    , _count(count), _flags(flags)
+    {
+        // A negative duration would yield a timespec the kernel rejects with -EINVAL.
+        // So "sleeping into the past" just expires immediately.
+        if (duration < std::chrono::duration<Rep, Period>::zero())
+            duration = std::chrono::duration<Rep, Period>::zero();
+        auto secs = std::chrono::duration_cast<std::chrono::seconds>(duration);
+        auto nsecs = std::chrono::duration_cast<std::chrono::nanoseconds>(duration - secs);
+        _timespec.tv_sec = secs.count();
+        _timespec.tv_nsec = nsecs.count();
+    }
+
+private:
+    void prepare_sqe(io_uring_sqe* sqe)
+    {
+        io_uring_prep_timeout(sqe, &_timespec, _count, _flags);
+    }
+    unsigned int _count = 0;
+    unsigned int _flags = 0;
+    // preserve timespec data in awaiter's lifecycle, to fulfill old kernel's requirement
+    struct __kernel_timespec _timespec {};
+};
+
+template <typename Rep, typename Period>
+inline SleepAwaiter<Rep, Period> sleep(Scheduler* scheduler, std::chrono::duration<Rep, Period> duration)
+{
+    return SleepAwaiter<Rep, Period>(scheduler, duration, 0, 0);
 }
 
 } // namespace yyasio

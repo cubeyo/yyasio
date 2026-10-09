@@ -102,6 +102,51 @@ yyasio::Task<void> timeout_trigger(yyasio::Scheduler* scheduler)
     }
 }
 
+yyasio::Task<void> sleep_and_report(yyasio::Scheduler* scheduler, const char* label, long long msecs)
+{
+    auto start = std::chrono::steady_clock::now();
+    int ret = co_await yyasio::sleep(scheduler, std::chrono::milliseconds(msecs));
+    long long elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - start).count();
+    std::cout << "  concurrent sleep(" << label << ") ret = " << ret
+              << ", elapsed = " << elapsed_ms << " ms\n";
+}
+
+yyasio::Task<void> sleep_demo(yyasio::Scheduler* scheduler)
+{
+    std::cout << "=== Sleep Demo ===\n";
+
+    // sleep() 直接接受 std::chrono::duration，并自己保管 timespec：调用方不需要像
+    // timeout() 那样再准备一个活到操作完成的 struct __kernel_timespec。
+    struct Case { const char* label; long long msecs; };
+    const Case cases[] = {
+        {"100ms", 100},
+        {"1s", 1000},
+        {"1500ms", 1500},
+        {"-50ms (negative, clamped to 0)", -50},
+    };
+
+    for (const auto& c : cases)
+    {
+        auto start = std::chrono::steady_clock::now();
+        int ret = co_await yyasio::sleep(scheduler, std::chrono::milliseconds(c.msecs));
+        long long elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - start).count();
+        // 定时器正常睡满时 io_uring 带回的是 -ETIME 而不是 0（与 timeout() 同一约定）
+        std::cout << "sleep(" << c.label << ") ret = " << ret << " (-ETIME = " << -ETIME
+                  << "), elapsed = " << elapsed_ms << " ms\n";
+    }
+
+    std::cout << "3 concurrent sleeps (50/120/190 ms), each awaiting its own duration:\n";
+    sleep_and_report(scheduler, "50ms", 50).detach();
+    sleep_and_report(scheduler, "120ms", 120).detach();
+    sleep_and_report(scheduler, "190ms", 190).detach();
+    // 自己也睡 300ms 让三个 fire-and-forget 协程有机会跑完（单线程循环里不要忙等）
+    co_await yyasio::sleep(scheduler, std::chrono::milliseconds(300));
+
+    std::cout << "=== Sleep Demo done ===\n";
+}
+
 yyasio::Task<void> rename_file_demo(yyasio::Scheduler* scheduler)
 {
     std::cout << "=== Rename File Demo ===\n";
@@ -639,6 +684,8 @@ int main()
     run_simple_server(&scheduler, 8080).detach();
 
     timeout_trigger(&scheduler).detach();
+
+    sleep_demo(&scheduler).detach();
 
     visit_regular_file(&scheduler).detach();
 

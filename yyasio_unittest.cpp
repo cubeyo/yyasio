@@ -431,6 +431,182 @@ BOOST_AUTO_TEST_CASE(test_timeout)
     runner.join();
 }
 
+// ==================== Sleep Test ====================
+
+// sleep() is the self-owning-timespec flavour of timeout(): the timer CQE still carries
+// -ETIME on a full sleep (same convention test_timeout asserts on), never 0.
+static constexpr long SLEEP_UNIT_NS = 1000000L; // 1ms, for the 80%-of-requested assertions
+
+Task<void> sleep_once(Scheduler* scheduler, long msecs, std::atomic<int>& result, std::atomic<long>& elapsed_ns)
+{
+    auto start = std::chrono::steady_clock::now();
+    int ret = co_await yyasio::sleep(scheduler, std::chrono::milliseconds(msecs));
+    auto end = std::chrono::steady_clock::now();
+    elapsed_ns.store(std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count());
+    std::cout << "sleep_once(" << msecs << "ms): ret = " << ret
+              << ", elapsed = " << elapsed_ns.load() << " ns\n";
+    result.store(ret);
+}
+
+BOOST_AUTO_TEST_CASE(test_sleep_expiry)
+{
+    Scheduler scheduler;
+
+    std::atomic<int> result{0};
+    std::atomic<long> elapsed_ns{0};
+    long want_ns = 200 * SLEEP_UNIT_NS;
+
+    sleep_once(&scheduler, 200, result, elapsed_ns).detach();
+
+    std::thread runner([&scheduler]() {
+        run_scheduler(scheduler);
+    });
+
+    auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (result.load() == 0 && std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+
+    BOOST_CHECK_EQUAL(result.load(), -ETIME);
+    BOOST_CHECK_GE(elapsed_ns.load(), want_ns * 8 / 10);
+    // Upper bound too: each SleepAwaiter owns its own timespec, so no timer may borrow
+    // another one's duration (a shared timespec lands here).
+    BOOST_CHECK_LE(elapsed_ns.load(), want_ns + 80 * SLEEP_UNIT_NS);
+    scheduler.stop();
+    runner.join();
+}
+
+// A sub-second duration must not collapse to "no wait": the seconds/nanoseconds split in
+// SleepAwaiter is the whole point of accepting a std::chrono::duration.
+BOOST_AUTO_TEST_CASE(test_sleep_sub_second_not_truncated)
+{
+    Scheduler scheduler;
+
+    std::atomic<int> result{0};
+    std::atomic<long> elapsed_ns{0};
+    long want_ns = 50 * SLEEP_UNIT_NS;
+
+    sleep_once(&scheduler, 50, result, elapsed_ns).detach();
+
+    std::thread runner([&scheduler]() {
+        run_scheduler(scheduler);
+    });
+
+    auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (result.load() == 0 && std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+
+    BOOST_CHECK_EQUAL(result.load(), -ETIME);
+    BOOST_CHECK_GE(elapsed_ns.load(), want_ns * 8 / 10);
+    BOOST_CHECK_LE(elapsed_ns.load(), want_ns + 80 * SLEEP_UNIT_NS);
+    scheduler.stop();
+    runner.join();
+}
+
+// A negative duration is clamped to zero instead of being handed to the kernel as an
+// invalid timespec: the waiter must still see the normal -ETIME, completing immediately
+// (without the clamp it comes back as -EINVAL).
+BOOST_AUTO_TEST_CASE(test_sleep_negative_clamped)
+{
+    Scheduler scheduler;
+
+    std::atomic<int> result{0};
+    std::atomic<long> elapsed_ns{0};
+
+    sleep_once(&scheduler, -50, result, elapsed_ns).detach();
+
+    std::thread runner([&scheduler]() {
+        run_scheduler(scheduler);
+    });
+
+    auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (result.load() == 0 && std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+
+    BOOST_CHECK_EQUAL(result.load(), -ETIME);
+    BOOST_CHECK_LE(elapsed_ns.load(), 30 * SLEEP_UNIT_NS);
+    scheduler.stop();
+    runner.join();
+}
+
+struct SleepRecord
+{
+    std::atomic<int> ret{0};
+    std::atomic<long> elapsed_ns{0};
+};
+
+Task<void> sleep_recorded(Scheduler* scheduler, long msecs, SleepRecord* rec, std::atomic<int>& done_count)
+{
+    auto start = std::chrono::steady_clock::now();
+    int ret = co_await yyasio::sleep(scheduler, std::chrono::milliseconds(msecs));
+    auto end = std::chrono::steady_clock::now();
+    rec->ret.store(ret);
+    rec->elapsed_ns.store(std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count());
+    std::cout << "sleep_recorded(" << msecs << "ms): ret = " << ret
+              << ", elapsed = " << rec->elapsed_ns.load() << " ns\n";
+    done_count.fetch_add(1);
+}
+
+// An IO submitted next to the timers must not be stuck behind them.
+Task<void> open_close_recorded(Scheduler* scheduler, SleepRecord* rec, std::atomic<int>& done_count)
+{
+    auto start = std::chrono::steady_clock::now();
+    int fd = co_await yyasio::openat(scheduler, AT_FDCWD, "/dev/null", O_RDONLY, 0);
+    rec->ret.store(fd);
+    if (fd >= 0)
+    {
+        co_await yyasio::close(scheduler, fd);
+    }
+    auto end = std::chrono::steady_clock::now();
+    rec->elapsed_ns.store(std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count());
+    std::cout << "open_close_recorded: fd = " << fd << "\n";
+    done_count.fetch_add(1);
+}
+
+// Three live SleepAwaiters at once: each carries its own timespec inside its own awaiter,
+// so every timer must honour its own duration, and the wall clock must not add up.
+BOOST_AUTO_TEST_CASE(test_sleep_concurrent_with_io)
+{
+    Scheduler scheduler;
+
+    std::array<SleepRecord, 4> recs;
+    std::atomic<int> done_count{0};
+    const long msecs[3] = {50, 120, 190};
+
+    auto wall_start = std::chrono::steady_clock::now();
+    for (int i = 0; i < 3; i++)
+    {
+        sleep_recorded(&scheduler, msecs[i], &recs[i], done_count).detach();
+    }
+    open_close_recorded(&scheduler, &recs[3], done_count).detach();
+
+    std::thread runner([&scheduler]() {
+        run_scheduler(scheduler);
+    });
+
+    auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (done_count.load() < 4 && std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    long long wall_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now() - wall_start).count();
+
+    BOOST_CHECK_EQUAL(done_count.load(), 4);
+    for (int i = 0; i < 3; i++)
+    {
+        BOOST_CHECK_EQUAL(recs[i].ret.load(), -ETIME);
+        BOOST_CHECK_GE(recs[i].elapsed_ns.load(), msecs[i] * SLEEP_UNIT_NS * 8 / 10);
+        BOOST_CHECK_LE(recs[i].elapsed_ns.load(), (msecs[i] + 80) * SLEEP_UNIT_NS);
+    }
+    BOOST_CHECK_GE(recs[3].ret.load(), 0);   // the openat fd, i.e. IO did go through
+    // Concurrent timers finish with the longest one (~190ms), not after their sum (~360ms).
+    BOOST_CHECK_LT(wall_ns, 310 * SLEEP_UNIT_NS);
+    scheduler.stop();
+    runner.join();
+}
+
 // ==================== CoroId Test ====================
 
 Task<uint64_t> get_sub_coro_id_test(Scheduler* scheduler)
