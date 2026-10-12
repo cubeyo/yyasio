@@ -8,6 +8,8 @@
 #include <memory>
 #include <random>
 #include <string>
+#include <tuple>
+#include <type_traits>
 #include <vector>
 #include <thread>
 #include <chrono>
@@ -697,6 +699,168 @@ BOOST_AUTO_TEST_CASE(test_run_in_thread_many_concurrent)
 
     scheduler.stop();
     runner.join();
+}
+
+// ---- run_in_thread<void> ----
+// void 版本没有返回值可以校验，所以断言只能压在别的三处事实上：
+// lambda 真的执行了（副作用）、执行它的线程是带外线程（不是 ring 线程）、
+// 协程最终被唤醒并拿回 rc。这三条缺一条，void 分支的实现错误就可能悄悄溜过去。
+
+// 编译期契约：T = void 时 await_resume 只回调度层 rc，不再附带值；
+// T 非 void 时保持 tuple 形态。调用方写成 `int rc = co_await run_in_thread<void>(...)`
+// 还是 `auto [rc, val] = ...`，由这里锁死。
+static_assert(std::is_same_v<decltype(std::declval<yyasio::ThreadAwaiter<void>&>().await_resume()), int>,
+              "run_in_thread<void> must await_resume() to int (rc only)");
+static_assert(std::is_same_v<decltype(std::declval<yyasio::ThreadAwaiter<int>&>().await_resume()), std::tuple<int, int>>,
+              "run_in_thread<T> must keep awaiting to std::tuple<int, T>");
+
+// 记录三个线程归属，用来证明工作确实被甩到带外线程、唤醒后又回到 ring 线程。
+// 对象存在测试主体里、用裸指针传：按值捕获 RAII 对象（shared_ptr 等）经 run_in_thread
+// 目前会多释放一次，属于已知问题，本用例不依赖也不能依赖它。
+// 可见性：worker_thread 由工作线程写、ring 线程在 co_await 之后读，靠 await_resume
+// 里的 join() 建立 happens-before；done 置位后测试线程才读，靠 atomic 默认序。
+struct RitVoidProbe
+{
+    std::thread::id ring_thread {};    // co_await 之前所在线程
+    std::thread::id worker_thread {};  // lambda 实际执行线程
+    std::thread::id resume_thread {};  // 被唤醒回来之后所在线程
+};
+
+Task<void> rit_void_job(Scheduler* scheduler, RitVoidProbe* probe, std::atomic<int>* ran,
+                        std::atomic<int>& rc_out, std::atomic<bool>& done)
+{
+    probe->ring_thread = std::this_thread::get_id();
+    int rc = co_await yyasio::run_in_thread<void>(scheduler, [probe, ran] {
+        probe->worker_thread = std::this_thread::get_id();
+        ran->fetch_add(1);
+    });
+    probe->resume_thread = std::this_thread::get_id();
+    rc_out.store(rc);
+    done.store(true);
+}
+
+BOOST_AUTO_TEST_CASE(test_run_in_thread_void_basic)
+{
+    Scheduler scheduler;
+    RitVoidProbe probe {};
+    std::atomic<int> ran{0};
+    std::atomic<int> rc{-1};
+    std::atomic<bool> done{false};
+
+    std::thread runner([&]() {
+        run_scheduler(scheduler, [&]() {
+            rit_void_job(&scheduler, &probe, &ran, rc, done).detach();
+        });
+    });
+
+    auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (!done.load() && std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+
+    // 没被唤醒就到这里为止 done 一直是 false，rc 保持 -1 —— 不会假绿
+    BOOST_CHECK(done.load());
+    BOOST_CHECK_EQUAL(rc.load(), 0);
+    BOOST_CHECK_EQUAL(ran.load(), 1);
+    // ring 线程确实是 runner 线程，不是测试主体线程
+    BOOST_CHECK(probe.ring_thread != std::this_thread::get_id());
+    BOOST_CHECK(probe.worker_thread != probe.ring_thread);
+    BOOST_CHECK(probe.resume_thread == probe.ring_thread);
+
+    scheduler.stop();
+    runner.join();
+}
+
+// 200 个 void 任务同时在飞，只校验计数：票一丢就永远等不到唤醒，票被重复投递
+// 或 lambda 被跑两遍就会让 ran 与 finished 对不上。
+constexpr int kRitVoidJobs = 200;
+
+Task<void> rit_void_counted(Scheduler* scheduler, int sleep_ms, std::atomic<int>* ran,
+                           std::atomic<int>* good, std::atomic<int>* finished)
+{
+    int rc = co_await yyasio::run_in_thread<void>(scheduler, [sleep_ms, ran] {
+        std::this_thread::sleep_for(std::chrono::milliseconds(sleep_ms));
+        ran->fetch_add(1);
+    });
+    if (rc == 0)
+    {
+        good->fetch_add(1);
+    }
+    finished->fetch_add(1);
+}
+
+BOOST_AUTO_TEST_CASE(test_run_in_thread_void_many_concurrent)
+{
+    Scheduler scheduler;
+
+    std::atomic<int> ran{0};
+    std::atomic<int> good{0};
+    std::atomic<int> finished{0};
+
+    std::vector<int> sleeps(kRitVoidJobs);
+    std::mt19937 rng(20261012);
+    std::uniform_int_distribution<int> dist(1, 50);
+    long long total_sleep_ms = 0;
+    for (int& v : sleeps)
+    {
+        v = dist(rng);
+        total_sleep_ms += v;
+    }
+
+    auto wall_start = std::chrono::steady_clock::now();
+    std::thread runner([&]() {
+        run_scheduler(scheduler, [&]() {
+            for (int i = 0; i < kRitVoidJobs; i++)
+            {
+                rit_void_counted(&scheduler, sleeps[i], &ran, &good, &finished).detach();
+            }
+        });
+    });
+
+    auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(60);
+    while (finished.load() < kRitVoidJobs && std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    long long wall_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - wall_start).count();
+    std::cout << "run_in_thread<void> x" << kRitVoidJobs << ": wall = " << wall_ms
+              << " ms, ran = " << ran.load() << ", good = " << good.load() << "\n";
+
+    BOOST_CHECK_EQUAL(finished.load(), kRitVoidJobs);
+    BOOST_CHECK_EQUAL(good.load(), kRitVoidJobs);
+    BOOST_CHECK_EQUAL(ran.load(), kRitVoidJobs);
+    // 并发而非串行：串行要花掉全部 sleep 之和，这里给三分之一的余量
+    BOOST_CHECK_LT(wall_ms, total_sleep_ms / 3);
+
+    scheduler.stop();
+    runner.join();
+}
+
+// Scheduler 从没 init() 过：register_coro_waiting_extern 直接判 -ECANCELED，
+// await_suspend 返回 false，worker 线程根本没被创建。
+// 这条守的是 void 分支上的两个防护：
+//   1) 被拒时不许跑 lambda —— 否则副作用会算到一个压根没被调度的任务上；
+//   2) await_resume 里 join() 之前必须查 joinable() —— 线程没起就 join 会抛
+//      std::system_error → terminate，整个测试进程当场没掉（int 分支同样的坑）。
+// detach() 在这里是同步跑完的：所有 await_suspend 都返回 false，没有 IO 要做。
+Task<void> rit_void_rejected_job(Scheduler* scheduler, std::atomic<int>& ran, std::atomic<int>& rc_out)
+{
+    int rc = co_await yyasio::run_in_thread<void>(scheduler, [&ran] {
+        ran.fetch_add(1);
+    });
+    rc_out.store(rc);
+}
+
+BOOST_AUTO_TEST_CASE(test_run_in_thread_void_rejected)
+{
+    Scheduler scheduler;   // 故意不调 init()
+    std::atomic<int> ran{0};
+    std::atomic<int> rc{0};
+
+    rit_void_rejected_job(&scheduler, ran, rc).detach();
+
+    BOOST_CHECK_EQUAL(rc.load(), -ECANCELED);
+    BOOST_CHECK_EQUAL(ran.load(), 0);
 }
 
 // ==================== CoroId Test ====================

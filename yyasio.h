@@ -1488,12 +1488,18 @@ inline SleepAwaiter<Rep, Period> sleep(Scheduler* scheduler, std::chrono::durati
 template <typename T>
 class ThreadAwaiter
 {
-    static_assert(std::is_default_constructible_v<T>, "T must be default constructible");
-    static_assert(std::is_move_constructible_v<T>, "T must be move constructible");
-    static_assert(std::is_move_assignable_v<T>, "T must be move assignable");
+    static_assert(
+        std::is_void_v<T> || 
+            (std::is_default_constructible_v<T> &&
+            std::is_move_constructible_v<T> &&
+            std::is_move_assignable_v<T>),
+        "T must be void, or default constructible + move constructible + move assignable");
+
+    using result_type = std::conditional_t<std::is_void_v<T>, std::monostate, T>;
+    using ret_type = std::conditional_t<std::is_void_v<T>, int, std::tuple<int, T>>;
 
 public:
-    explicit ThreadAwaiter(Scheduler* scheduler, std::function<T()> func)
+    explicit ThreadAwaiter(Scheduler* scheduler, std::function<T()>&& func)
     : _scheduler(scheduler), _func(std::move(func)) {}
 
     bool await_ready() const noexcept { return false; }
@@ -1506,31 +1512,37 @@ public:
             return false;
         }
         _thread = std::thread([this, ticket] {
-            result = _func();
+            if constexpr (std::is_void_v<T>)
+                _func();
+            else
+                result = _func();
             _scheduler->wakeup_coro_by_ticket(ticket);
         });
         return true;
     }
 
-    std::tuple<int, T> await_resume() noexcept
+    ret_type await_resume() noexcept
     {
         if (_thread.joinable())
             _thread.join();
-        return {ret, std::move(result)};
+        if constexpr (std::is_void_v<T>)
+            return ret;
+        else
+            return {ret, std::move(result)};
     }
 
 private:
     Scheduler* _scheduler;
-    T result {};
+    result_type result {};
     int ret = 0;
     std::thread _thread {};
     std::function<T()> _func;
 };
 
-template <typename T, typename F>
-inline ThreadAwaiter<T> run_in_thread(Scheduler* s, F&& f)
+template <typename T>
+inline ThreadAwaiter<T> run_in_thread(Scheduler* s, std::function<T()>&& f)
 {
-    return ThreadAwaiter<T>(s, std::function<T()>(std::forward<F>(f)));
+    return ThreadAwaiter<T>(s, std::move(f));
 }
 
 
