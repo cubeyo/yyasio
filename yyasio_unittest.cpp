@@ -1773,6 +1773,152 @@ BOOST_AUTO_TEST_CASE(test_sync_file_range_badfd)
     runner.join();
 }
 
+// ==================== Fsync Test ====================
+
+static const char* TEST_FSYNC_PATH = "/tmp/yyasio_test_fsync.txt";
+
+// Write TEST_CONTENT through the async path onto a real fd, then co_await fsync to push
+// it to stable storage. fsync() returns 0 on success; the test body re-reads the file
+// afterwards to prove the data really made it to disk.
+Task<void> fsync_coro(Scheduler* scheduler, std::atomic<int>& result)
+{
+    int fd = co_await openat(scheduler, AT_FDCWD, TEST_FSYNC_PATH, O_RDWR | O_CREAT | O_TRUNC, 0644);
+    BOOST_REQUIRE(fd > 0);
+
+    int written = co_await write(scheduler, fd, TEST_CONTENT, strlen(TEST_CONTENT));
+    BOOST_REQUIRE_EQUAL(written, (int)strlen(TEST_CONTENT));
+
+    int ret = co_await fsync(scheduler, fd);
+    std::cout << "fsync_coro: ret = " << ret << "\n";
+
+    BOOST_CHECK_EQUAL(co_await close(scheduler, fd), 0);
+    result.store(ret);
+}
+
+BOOST_AUTO_TEST_CASE(test_fsync)
+{
+    unlink(TEST_FSYNC_PATH);
+
+    Scheduler scheduler;
+
+    std::atomic<int> fsync_result{-1};
+    std::thread runner([&]() {
+        run_scheduler(scheduler, [&]() {
+            fsync_coro(&scheduler, fsync_result).detach();
+        });
+    });
+
+    auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (fsync_result.load() == -1 && std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+
+    // fsync() returns 0 on success
+    BOOST_CHECK_EQUAL(fsync_result.load(), 0);
+
+    // Ground truth: reopen through the kernel and read the content back off disk.
+    int fd = ::open(TEST_FSYNC_PATH, O_RDONLY);
+    BOOST_REQUIRE(fd > 0);
+    char buffer[256] = {0};
+    BOOST_CHECK_EQUAL(::pread(fd, buffer, sizeof(buffer), 0), (long)strlen(TEST_CONTENT));
+    BOOST_CHECK_EQUAL(std::string(buffer), std::string(TEST_CONTENT));
+    ::close(fd);
+
+    unlink(TEST_FSYNC_PATH);
+    scheduler.stop();
+    runner.join();
+}
+
+// ==================== Fsync DATASYNC Test ====================
+
+static const char* TEST_FSYNC_DATASYNC_PATH = "/tmp/yyasio_test_fsync_datasync.txt";
+
+// Exercise the flag path on its own: IORING_FSYNC_DATASYNC mirrors fdatasync(), flushing
+// data but skipping metadata not required to read it back. The wrapper must forward the
+// flag to io_uring_prep_fsync and still return 0 on a valid fd.
+Task<void> fsync_datasync_coro(Scheduler* scheduler, std::atomic<int>& result)
+{
+    int fd = co_await openat(scheduler, AT_FDCWD, TEST_FSYNC_DATASYNC_PATH, O_RDWR | O_CREAT | O_TRUNC, 0644);
+    BOOST_REQUIRE(fd > 0);
+
+    int written = co_await write(scheduler, fd, TEST_CONTENT, strlen(TEST_CONTENT));
+    BOOST_REQUIRE_EQUAL(written, (int)strlen(TEST_CONTENT));
+
+    int ret = co_await fsync(scheduler, fd, IORING_FSYNC_DATASYNC);
+    std::cout << "fsync_datasync_coro: ret = " << ret << "\n";
+
+    BOOST_CHECK_EQUAL(co_await close(scheduler, fd), 0);
+    result.store(ret);
+}
+
+BOOST_AUTO_TEST_CASE(test_fsync_datasync)
+{
+    unlink(TEST_FSYNC_DATASYNC_PATH);
+
+    Scheduler scheduler;
+
+    std::atomic<int> fsync_result{-1};
+    std::thread runner([&]() {
+        run_scheduler(scheduler, [&]() {
+            fsync_datasync_coro(&scheduler, fsync_result).detach();
+        });
+    });
+
+    auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (fsync_result.load() == -1 && std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+
+    BOOST_CHECK_EQUAL(fsync_result.load(), 0);
+
+    // fdatasync still flushes the data: the file must read back intact.
+    int fd = ::open(TEST_FSYNC_DATASYNC_PATH, O_RDONLY);
+    BOOST_REQUIRE(fd > 0);
+    char buffer[256] = {0};
+    BOOST_CHECK_EQUAL(::pread(fd, buffer, sizeof(buffer), 0), (long)strlen(TEST_CONTENT));
+    BOOST_CHECK_EQUAL(std::string(buffer), std::string(TEST_CONTENT));
+    ::close(fd);
+
+    unlink(TEST_FSYNC_DATASYNC_PATH);
+    scheduler.stop();
+    runner.join();
+}
+
+// ==================== Fsync BadFd Test ====================
+
+// The mutation ground-truth for the two success-path cases above. fsync on an invalid fd
+// fails with -EBADF, whereas a silently no-op'd wrapper (io_uring_prep_fsync ->
+// io_uring_prep_nop) still completes with 0 -- exactly the ftruncate lesson that the
+// completion code alone cannot prove the operation ran. Since a fsync that did nothing
+// also returns 0, this negative case is what pins the wrapper to real behavior.
+Task<void> fsync_badfd_coro(Scheduler* scheduler, std::atomic<int>& result)
+{
+    int ret = co_await fsync(scheduler, -1);
+    std::cout << "fsync_badfd_coro: ret = " << ret << "\n";
+    result.store(ret);
+}
+
+BOOST_AUTO_TEST_CASE(test_fsync_badfd)
+{
+    Scheduler scheduler;
+
+    std::atomic<int> fsync_result{-1};
+    std::thread runner([&]() {
+        run_scheduler(scheduler, [&]() {
+            fsync_badfd_coro(&scheduler, fsync_result).detach();
+        });
+    });
+
+    auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (fsync_result.load() == -1 && std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+
+    BOOST_CHECK_EQUAL(fsync_result.load(), -EBADF);
+    scheduler.stop();
+    runner.join();
+}
+
 // ==================== Ftruncate Test ====================
 
 static const char* TEST_FTRUNCATE_PATH = "/tmp/yyasio_test_ftruncate.txt";

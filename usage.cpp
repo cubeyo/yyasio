@@ -524,6 +524,57 @@ yyasio::Task<void> ftruncate_demo(yyasio::Scheduler* scheduler)
     unlink(file_path);
 }
 
+// fsync() through io_uring (kernel >= 5.4): flush the file behind an open fd to stable
+// storage. await_resume() gives back the fsync(2) result -- 0 on success, -errno
+// otherwise. The optional flags map onto io_uring_prep_fsync's fsync_flags; passing
+// IORING_FSYNC_DATASYNC behaves like fdatasync(2), skipping metadata not needed to read
+// the data back (e.g. mtime). The constant comes from <liburing.h>, pulled in by yyasio.h.
+yyasio::Task<void> fsync_demo(yyasio::Scheduler* scheduler)
+{
+    std::cout << "=== Fsync Demo ===\n";
+
+    const char* file_path = "/tmp/yyasio_fsync_demo.txt";
+
+    int fd = co_await yyasio::openat(scheduler, AT_FDCWD, file_path, O_RDWR | O_CREAT | O_TRUNC, 0644);
+    if (fd < 0)
+    {
+        std::cerr << "Failed to create file: " << file_path << "\n";
+        co_return;
+    }
+
+    const char* content = "data that must survive an fsync";
+    co_await yyasio::write(scheduler, fd, content, strlen(content));
+
+    // Full fsync: flush data and the metadata needed to retrieve it
+    int ret = co_await yyasio::fsync(scheduler, fd);
+    if (ret < 0)
+    {
+        std::cerr << "fsync failed, ret = " << ret << "\n";
+    }
+    else
+    {
+        std::cout << "fsync(fd) ok, data is on stable storage\n";
+    }
+
+    // fdatasync-style flush: skip metadata that does not affect reading the data back
+    ret = co_await yyasio::fsync(scheduler, fd, IORING_FSYNC_DATASYNC);
+    if (ret < 0)
+    {
+        std::cerr << "fsync(DATASYNC) failed, ret = " << ret << "\n";
+    }
+    else
+    {
+        std::cout << "fsync(IORING_FSYNC_DATASYNC) ok\n";
+    }
+
+    // An invalid fd surfaces the error as -EBADF through the completion result, no exception
+    ret = co_await yyasio::fsync(scheduler, -1);
+    std::cout << "fsync on an invalid fd: ret = " << ret << " (-EBADF = " << -EBADF << ")\n";
+
+    co_await yyasio::close(scheduler, fd);
+    unlink(file_path);
+}
+
 yyasio::Task<void> visit_regular_file(yyasio::Scheduler* scheduler)
 {
     int dir_fd = co_await yyasio::openat(scheduler, AT_FDCWD, "/tmp", O_RDONLY | O_DIRECTORY);
@@ -822,6 +873,8 @@ int main()
     statx_demo(&scheduler).detach();
 
     ftruncate_demo(&scheduler).detach();
+
+    fsync_demo(&scheduler).detach();
 
     mutex_demo(&scheduler).detach();
 

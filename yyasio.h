@@ -1349,6 +1349,17 @@ inline UringAwaiter sync_file_range(Scheduler* scheduler, int fd, uint64_t offse
     return UringAwaiter{ scheduler, prepare_sqe_cb };
 }
 
+// Requires: kernel >= 5.4 (IORING_OP_FSYNC). Flushes the file referred to by fd,
+// mirroring fsync(2). Pass IORING_FSYNC_DATASYNC as `flags` for an fdatasync()-like
+// flush that skips metadata not needed to access the data (e.g. mtime).
+inline UringAwaiter fsync(Scheduler* scheduler, int fd, unsigned flags = 0)
+{
+    PrepSqeClosure prepare_sqe_cb = [fd, flags](io_uring_sqe* sqe) -> void {
+        io_uring_prep_fsync(sqe, fd, flags);
+    };
+    return UringAwaiter{ scheduler, prepare_sqe_cb };
+}
+
 // Requires: kernel >= 6.11 (IORING_OP_FTRUNCATE); older kernels reject the opcode with
 // -EOPNOTSUPP. Truncates (or extends) the file referred to by fd to exactly `len` bytes.
 inline UringAwaiter ftruncate(Scheduler* scheduler, int fd, off_t len)

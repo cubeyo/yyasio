@@ -7,7 +7,7 @@
 ## 特性
 
 - **Header-only**：单个头文件 `yyasio.h`，拷贝即用。
-- **io_uring 封装**：`read` / `write` / `sync_file_range` / `openat` / `close` / `accept` / `connect` / `listen` / `timeout` / `sleep` / `renameat` / `unlinkat` / `mkdirat` / `statx` / `ftruncate` / `cancel_fd` 等常用操作的异步 awaiter。
+- **io_uring 封装**：`read` / `write` / `sync_file_range` / `fsync` / `openat` / `close` / `accept` / `connect` / `listen` / `timeout` / `sleep` / `renameat` / `unlinkat` / `mkdirat` / `statx` / `ftruncate` / `cancel_fd` 等常用操作的异步 awaiter。
 - **C++20 协程支持**：`Task<T>` / `Task<void>`，支持 `co_await` 组合与 `detach()` 的 fire-and-forget 用法。
 - **单线程事件循环**：`Scheduler` 以单线程驱动 io_uring，模型简单、无锁竞争。
 - **带外工作线程**：`run_in_thread` 把无法交给 io_uring 的阻塞调用丢到普通线程执行，协程 `co_await` 等结果；结果经控制管道回到 ring 线程，**协程只可能在 ring 线程上恢复**，因此不会破坏 `Event` / `Mutex` 的同线程契约。
@@ -24,6 +24,7 @@
 | 操作系统 | Linux 内核 **5.11+** | io_uring 基础操作 |
 | 内核 5.6+ | `statx` | 依赖 `IORING_OP_STATX`；早于本库 5.11 基线，故无额外要求 |
 | 内核 5.4+ | `timeout` / `sleep` | 依赖 `IORING_OP_TIMEOUT`；早于本库 5.11 基线，故无额外要求 |
+| 内核 5.4+ | `fsync` | 依赖 `IORING_OP_FSYNC`；早于本库 5.11 基线，故无额外要求 |
 | 内核 **5.13+** | `run_in_thread` / `stop()` | 依赖 `IORING_OP_POLL_ADD` + `IORING_POLL_ADD_MULTI` 常驻监听控制管道，**高于本库 5.11 基线**；不使用这两个能力时仍是 5.11 |
 | 内核 **5.15+** | `mkdirat` | 依赖 `IORING_OP_MKDIRAT`（`renameat` / `unlinkat` 只需 5.11） |
 | 内核 5.19+ | `cancel_fd` | 异步取消（`IORING_ASYNC_CANCEL_FD`） |
@@ -99,7 +100,7 @@ int main()
 }
 ```
 
-完整示例见 [`usage.cpp`](./usage.cpp)（含回声服务器、文件读写、目录增删改、`statx` 元信息、`ftruncate` 截断、`sleep` 定时睡眠、超时轮询、`TimeoutEvent`、协程 ID 获取等），协程与 API 的单元测试见 [`yyasio_unittest.cpp`](./yyasio_unittest.cpp)。
+完整示例见 [`usage.cpp`](./usage.cpp)（含回声服务器、文件读写、目录增删改、`statx` 元信息、`ftruncate` 截断、`fsync` 落盘、`sleep` 定时睡眠、超时轮询、`TimeoutEvent`、协程 ID 获取等），协程与 API 的单元测试见 [`yyasio_unittest.cpp`](./yyasio_unittest.cpp)。
 
 ### TCP 网络（accept / read / write）
 
@@ -278,6 +279,25 @@ yyasio::Task<void> ftruncate_demo(yyasio::Scheduler* scheduler) {
 
 需内核 **6.11+**（`IORING_OP_FTRUNCATE`）：早于该版本的内核会把这个 opcode 拒成 `-EOPNOTSUPP`，**高于本库 5.11 基线**。liburing ≥ 2.4 直接走 `io_uring_prep_ftruncate()`，更旧的 liburing 则手填 SQE（`io_uring_prep_rw(IORING_OP_FTRUNCATE, ...)`，长度写入 `off` 字段）。完整演示见 [`usage.cpp`](./usage.cpp) 的 `ftruncate_demo`，回归用例见 [`yyasio_unittest.cpp`](./yyasio_unittest.cpp) 的 `test_ftruncate`。
 
+### 文件落盘（fsync）
+
+`fsync` 对应系统调用 `fsync(2)`，作用在**已打开的 fd**：把该文件的数据与必要的元数据刷到稳定存储，`co_await` 返回 `fsync(2)` 的结果（成功 `0`，失败 `-errno`）。可选的 `flags` 透传给 `io_uring_prep_fsync`，传 `IORING_FSYNC_DATASYNC` 即等价 `fdatasync(2)`——只刷读回数据所必需的部分，跳过诸如 `mtime` 这类元数据：
+
+```cpp
+yyasio::Task<void> fsync_demo(yyasio::Scheduler* scheduler) {
+    int fd = co_await yyasio::openat(scheduler, AT_FDCWD, "/tmp/a.txt", O_RDWR | O_CREAT | O_TRUNC, 0644);
+    if (fd < 0) co_return;
+    const char* content = "data that must survive an fsync";
+    co_await yyasio::write(scheduler, fd, content, strlen(content));
+
+    int ret = co_await yyasio::fsync(scheduler, fd);                     // 全量 fsync
+    ret = co_await yyasio::fsync(scheduler, fd, IORING_FSYNC_DATASYNC);  // fdatasync 风格
+    co_await yyasio::close(scheduler, fd);
+}
+```
+
+`IORING_FSYNC_DATASYNC` 已由 `yyasio.h` 经 `<liburing.h>` 引入，调用方无需额外 include。无效 fd 会以 `-EBADF` 形式从返回值给出，不涉及异常。与 `sync_file_range` 的区别：后者按 `[offset, len)` 区间触发写回、用 `SYNC_FILE_RANGE_*` 控制是否等待，`fsync` 则整档刷盘并保证元数据一致。需内核 **5.4+**（`IORING_OP_FSYNC`，早于本库 5.11 基线，故无额外要求）。完整演示见 [`usage.cpp`](./usage.cpp) 的 `fsync_demo`，回归用例见 [`yyasio_unittest.cpp`](./yyasio_unittest.cpp) 的 `test_fsync` / `test_fsync_datasync` / `test_fsync_badfd`。
+
 ### 定时睡眠（sleep）
 
 `co_await yyasio::sleep(scheduler, 1500ms)` 挂起当前协程、到点再回来，接受任意 `std::chrono::duration`：
@@ -340,6 +360,7 @@ yyasio::Task<void> work(yyasio::Scheduler* scheduler) {
 | `read(sched, fd, buf, size, offset=0)` | 读 |
 | `write(sched, fd, buf, size, offset=0)` | 写 |
 | `sync_file_range(sched, fd, offset, len, flags)` | 同步文件区间到存储，`flags` 为 `SYNC_FILE_RANGE_WRITE` / `SYNC_FILE_RANGE_WAIT_BEFORE` / `SYNC_FILE_RANGE_WAIT_AFTER` 的组合（需 `<fcntl.h>`） |
+| `fsync(sched, fd, flags=0)` | 将打开 fd 对应的整档文件刷到稳定存储（对应 `fsync(2)`），返回 `0` / `-errno`；`flags` 传 `IORING_FSYNC_DATASYNC` 等价 `fdatasync(2)`（需内核 5.4+，详见下文） |
 | `close(sched, fd)` | 关闭 fd |
 | `accept(sched, listen_fd, addr, len, flags)` | 接受连接 |
 | `connect(sched, fd, addr, len)` | 发起连接 |
