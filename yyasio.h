@@ -1349,6 +1349,20 @@ inline UringAwaiter sync_file_range(Scheduler* scheduler, int fd, uint64_t offse
     return UringAwaiter{ scheduler, prepare_sqe_cb };
 }
 
+// Requires: kernel >= 6.11 (IORING_OP_FTRUNCATE); older kernels reject the opcode with
+// -EOPNOTSUPP. Truncates (or extends) the file referred to by fd to exactly `len` bytes.
+inline UringAwaiter ftruncate(Scheduler* scheduler, int fd, off_t len)
+{
+    PrepSqeClosure prepare_sqe_cb = [fd, len](io_uring_sqe* sqe) -> void {
+#if YYASIO_LIBURING_AT_LEAST(2, 4)
+        io_uring_prep_ftruncate(sqe, fd, len);
+#else
+        io_uring_prep_rw(IORING_OP_FTRUNCATE, sqe, fd, nullptr, 0, len);
+#endif
+    };
+    return UringAwaiter{ scheduler, prepare_sqe_cb };
+}
+
 // for kernel <= 5.9, time_spec should be valid until the operation completes
 inline UringAwaiter timeout(Scheduler* scheduler, struct __kernel_timespec* time_spec, unsigned int count = 0, unsigned int flags = 0)
 {

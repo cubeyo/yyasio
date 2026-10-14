@@ -7,7 +7,7 @@
 ## 特性
 
 - **Header-only**：单个头文件 `yyasio.h`，拷贝即用。
-- **io_uring 封装**：`read` / `write` / `sync_file_range` / `openat` / `close` / `accept` / `connect` / `listen` / `timeout` / `sleep` / `renameat` / `unlinkat` / `mkdirat` / `statx` / `cancel_fd` 等常用操作的异步 awaiter。
+- **io_uring 封装**：`read` / `write` / `sync_file_range` / `openat` / `close` / `accept` / `connect` / `listen` / `timeout` / `sleep` / `renameat` / `unlinkat` / `mkdirat` / `statx` / `ftruncate` / `cancel_fd` 等常用操作的异步 awaiter。
 - **C++20 协程支持**：`Task<T>` / `Task<void>`，支持 `co_await` 组合与 `detach()` 的 fire-and-forget 用法。
 - **单线程事件循环**：`Scheduler` 以单线程驱动 io_uring，模型简单、无锁竞争。
 - **带外工作线程**：`run_in_thread` 把无法交给 io_uring 的阻塞调用丢到普通线程执行，协程 `co_await` 等结果；结果经控制管道回到 ring 线程，**协程只可能在 ring 线程上恢复**，因此不会破坏 `Event` / `Mutex` 的同线程契约。
@@ -29,6 +29,7 @@
 | 内核 5.19+ | `cancel_fd` | 异步取消（`IORING_ASYNC_CANCEL_FD`） |
 | 内核 **5.5+** | `TimeoutEvent` / `abandon()` | 依赖 `IORING_OP_ASYNC_CANCEL` 按 `user_data` 取消（`flags = 0`）；`IORING_ASYNC_CANCEL_*` 匹配标志需更新内核，本库当前未使用 |
 | 内核 **6.0+** | 可选优化 | `IORING_SETUP_SINGLE_ISSUER` / `IORING_SETUP_DEFER_TASKRUN`；低版本内核会自动回退到无 flag 模式 |
+| 内核 **6.11+** | `ftruncate` | 依赖 `IORING_OP_FTRUNCATE`，**高于本库 5.11 基线**；低版本内核上该 opcode 返回 `-EOPNOTSUPP` |
 | 编译器 | GCC 10+（建议 GCC 11+） | 需支持 C++20 `std::coroutine`；GCC 11 不支持 requires 子句过滤成员函数，代码已做兼容 |
 | 依赖库 | `liburing` | 异步 I/O 后端。`abandon()` 用到 `io_uring_prep_cancel64()`：若你的 liburing 没有这个内联函数，可等价地手填 SQE（`opcode = IORING_OP_ASYNC_CANCEL` + `sqe->addr = user_data`），同 `cancel_fd` 在 liburing < 2.3 下的兼容路径。`run_in_thread` / `stop()` 用到 `io_uring_prep_poll_multishot()`，旧版 liburing 下也可手填：`opcode = IORING_OP_POLL_ADD`、`fd` 为管道读端、`len` 先置 `POLLIN` 再叠加 `IORING_POLL_ADD_MULTI`、`addr` 置 0 |
 | 依赖库 | `libunwind` | 仅在开启栈回溯宏时需要 |
@@ -98,7 +99,53 @@ int main()
 }
 ```
 
-完整示例见 [`usage.cpp`](./usage.cpp)（含回声服务器、文件读写、目录增删改、`statx` 元信息、`sleep` 定时睡眠、超时轮询、`TimeoutEvent`、协程 ID 获取等），协程与 API 的单元测试见 [`yyasio_unittest.cpp`](./yyasio_unittest.cpp)。
+完整示例见 [`usage.cpp`](./usage.cpp)（含回声服务器、文件读写、目录增删改、`statx` 元信息、`ftruncate` 截断、`sleep` 定时睡眠、超时轮询、`TimeoutEvent`、协程 ID 获取等），协程与 API 的单元测试见 [`yyasio_unittest.cpp`](./yyasio_unittest.cpp)。
+
+### TCP 网络（accept / read / write）
+
+监听 socket 用常规 libc 调用建立（`socket()` / `setsockopt()` / `bind()`），之后 `listen` / `accept` / `read` / `write` 都交给 io_uring。`read` / `write` 这组 awaiter 对**普通文件和 socket fd 通用**，返回值都是 io_uring 风格：`>= 0` 为成功，`< 0` 为 `-errno`。下面是一个单线程 echo 服务器：
+
+```cpp
+yyasio::Task<void> echo_server(yyasio::Scheduler* scheduler, int port) {
+    // 1) 建监听 fd：SOCK_NONBLOCK 让 accept / 后续操作不阻塞 ring 线程
+    int listen_fd = ::socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+    int opt = 1;
+    ::setsockopt(listen_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+    sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = INADDR_ANY;
+    addr.sin_port = htons(port);
+    ::bind(listen_fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr));
+
+    // 2) io_uring 原生 listen（IORING_OP_LISTEN），backlog 默认 SOMAXCONN
+    if (co_await yyasio::listen(scheduler, listen_fd) < 0) {
+        std::cerr << "listen failed\n"; co_return;
+    }
+
+    // 3) accept 循环：peer 地址与 len 是指针捕获，需存活到操作完成（放协程帧内局部变量）
+    while (true) {
+        sockaddr_in peer{};
+        socklen_t len = sizeof(peer);
+        int conn_fd = co_await yyasio::accept(scheduler, listen_fd,
+                                              reinterpret_cast<sockaddr*>(&peer), &len);
+        if (conn_fd < 0) { std::cerr << "accept: " << conn_fd << "\n"; continue; }
+        handle_conn(scheduler, conn_fd).detach();  // 每条连接一个 fire-and-forget 协程
+    }
+}
+
+yyasio::Task<void> handle_conn(yyasio::Scheduler* scheduler, int conn_fd) {
+    char buf[1024];
+    while (true) {
+        int n = co_await yyasio::read(scheduler, conn_fd, buf, sizeof(buf));
+        if (n <= 0) break;               // 0 = 对端关闭；< 0 = -errno（如 -ECONNRESET）
+        // 原样回写：socket 上 write 的 offset 传 0（默认参数就是 0）
+        if (co_await yyasio::write(scheduler, conn_fd, buf, n, 0) < 0) break;
+    }
+    co_await yyasio::close(scheduler, conn_fd);  // 用完关掉，避免 fd 泄漏
+}
+```
+
+客户端侧用 `co_await yyasio::connect(scheduler, fd, addr, len)` 发起连接（连接中的 socket 需 `SOCK_NONBLOCK`，异步 connect 才能挂起等完成而非阻塞），随后同样用 `read` / `write` 收发。完整演示见 [`usage.cpp`](./usage.cpp) 的 `run_simple_server` / `accept_connections` / `handle_client`（服务端）与 `connect_and_send`（客户端）。
 
 ### 协程组合与生命周期
 
@@ -212,6 +259,25 @@ yyasio::Task<void> statx_demo(yyasio::Scheduler* scheduler) {
 
 `statxbuf` 与 `path` 都是指针捕获，内核要到 CQE 回来时才写缓冲，所以两者必须存活到操作完成——放在协程帧内的局部变量即可。完整流程（含不存在路径的 `-ENOENT`）见 [`usage.cpp`](./usage.cpp) 的 `statx_demo`。
 
+### 文件大小调整（ftruncate）
+
+`ftruncate` 对应系统调用 `ftruncate(2)`，作用在**已打开的 fd**（不传路径）：把文件调整为恰好 `len` 字节——`len` 小于当前长度则截掉尾部，大于则扩展、中间形成空洞（读回为 `\0`，不占实际磁盘块）。`co_await` 返回 `ftruncate(2)` 的结果（成功 `0`，失败 `-errno`）：
+
+```cpp
+yyasio::Task<void> ftruncate_demo(yyasio::Scheduler* scheduler) {
+    int fd = co_await yyasio::openat(scheduler, AT_FDCWD, "/tmp/a.txt", O_RDWR);
+    if (fd < 0) co_return;
+    int ret = co_await yyasio::ftruncate(scheduler, fd, 5);   // 截到 5 字节
+    // 新长度用 statx 复核（ftruncate 只给返回码，不给新尺寸）
+    struct statx stx {};
+    co_await yyasio::statx(scheduler, AT_FDCWD, "/tmp/a.txt", &stx);
+    std::cout << "size = " << stx.stx_size << "\n";
+    co_await yyasio::close(scheduler, fd);
+}
+```
+
+需内核 **6.11+**（`IORING_OP_FTRUNCATE`）：早于该版本的内核会把这个 opcode 拒成 `-EOPNOTSUPP`，**高于本库 5.11 基线**。liburing ≥ 2.4 直接走 `io_uring_prep_ftruncate()`，更旧的 liburing 则手填 SQE（`io_uring_prep_rw(IORING_OP_FTRUNCATE, ...)`，长度写入 `off` 字段）。完整演示见 [`usage.cpp`](./usage.cpp) 的 `ftruncate_demo`，回归用例见 [`yyasio_unittest.cpp`](./yyasio_unittest.cpp) 的 `test_ftruncate`。
+
 ### 定时睡眠（sleep）
 
 `co_await yyasio::sleep(scheduler, 1500ms)` 挂起当前协程、到点再回来，接受任意 `std::chrono::duration`：
@@ -284,6 +350,7 @@ yyasio::Task<void> work(yyasio::Scheduler* scheduler) {
 | `unlinkat(sched, dirfd, path, flags=0)` | 删除；删目录传 `flags = AT_REMOVEDIR`，且目录必须已空 |
 | `mkdirat(sched, dirfd, path, mode=0755)` | 创建目录，`mode` 受进程 umask 过滤（需内核 5.15+） |
 | `statx(sched, dirfd, path, buf, flags=0, mask=0x7ff)` | 文件元信息，结果写入 `*buf`，返回 `0` / `-errno`；`mask` 即 `STATX_BASIC_STATS`，`flags` 可传 `AT_SYMLINK_NOFOLLOW`、`AT_EMPTY_PATH`（需 `<sys/stat.h>`，内核 5.6+） |
+| `ftruncate(sched, fd, len)` | 把打开 fd 对应的文件截断／扩展到恰好 `len` 字节，返回 `0` / `-errno`（需内核 6.11+，详见下文） |
 | `cancel_fd(sched, fd, flags=0)` | 取消某 fd 上的在途请求 |
 | `ev.wait_until(duration)` | `TimeoutEvent`：最多等待 `duration`，可被 `set()` 提前唤醒，返回 `void` |
 | `ev.set()` | 唤醒等待中的协程，并 `abandon()` 掉未触发的定时器 |

@@ -1773,6 +1773,85 @@ BOOST_AUTO_TEST_CASE(test_sync_file_range_badfd)
     runner.join();
 }
 
+// ==================== Ftruncate Test ====================
+
+static const char* TEST_FTRUNCATE_PATH = "/tmp/yyasio_test_ftruncate.txt";
+// Filler written before the truncate -- deliberately longer than the target size so a
+// ftruncate that silently did nothing leaves stx_size at FILL and the check below fails.
+static constexpr off_t TEST_FTRUNCATE_FILL = 64;
+static constexpr off_t TEST_FTRUNCATE_TARGET = 20;
+
+// Write an over-long file, co_await ftruncate it down to TARGET, then co_await statx to
+// read the size back off the inode. The statx path/buffer stay in this coroutine's own
+// frame because the statx wrapper carries the pointer rather than a copy. size_result
+// publishes the observed stx_size; last_ret (release) is the completion signal the test
+// thread waits on.
+Task<void> ftruncate_coro(Scheduler* scheduler, std::atomic<int>& size_result, std::atomic<int>& last_ret)
+{
+    int fd = co_await openat(scheduler, AT_FDCWD, TEST_FTRUNCATE_PATH, O_RDWR | O_CREAT | O_TRUNC, 0644);
+    BOOST_REQUIRE(fd > 0);
+
+    std::array<char, 64> filler{};
+    filler.fill('A');
+    int written = co_await write(scheduler, fd, filler.data(), filler.size());
+    BOOST_REQUIRE_EQUAL(written, (int)TEST_FTRUNCATE_FILL);
+
+    // Sanity: the file really is oversized before the truncate, so the size check
+    // afterwards cannot pass by accident.
+    struct statx pre {};
+    BOOST_REQUIRE_EQUAL(co_await statx(scheduler, AT_FDCWD, TEST_FTRUNCATE_PATH, &pre), 0);
+    BOOST_REQUIRE(pre.stx_size == (unsigned long long)TEST_FTRUNCATE_FILL);
+
+    int trunc_ret = co_await ftruncate(scheduler, fd, TEST_FTRUNCATE_TARGET);
+    std::cout << "ftruncate_coro: ftruncate ret = " << trunc_ret << "\n";
+
+    struct statx post {};
+    int statx_ret = co_await statx(scheduler, AT_FDCWD, TEST_FTRUNCATE_PATH, &post);
+    std::cout << "ftruncate_coro: stx_size = " << post.stx_size << "\n";
+
+    size_result.store(statx_ret == 0 ? (int)post.stx_size : statx_ret);
+    last_ret.store(trunc_ret, std::memory_order_release);
+    BOOST_CHECK_EQUAL(co_await close(scheduler, fd), 0);
+}
+
+BOOST_AUTO_TEST_CASE(test_ftruncate)
+{
+    unlink(TEST_FTRUNCATE_PATH);
+
+    Scheduler scheduler;
+
+    std::atomic<int> size_result{-1};
+    std::atomic<int> last_ret{std::numeric_limits<int>::max()};  // sentinel until the coroutine publishes
+    std::thread runner([&]() {
+        run_scheduler(scheduler, [&]() {
+            ftruncate_coro(&scheduler, size_result, last_ret).detach();
+        });
+    });
+
+    auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (last_ret.load(std::memory_order_acquire) == std::numeric_limits<int>::max()
+           && std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+
+    // ftruncate() returns 0 on success
+    BOOST_CHECK_EQUAL(last_ret.load(), 0);
+    // statx reports the file shrunk to exactly the target length -- the real proof the
+    // truncate ran; a no-op wrapper would leave size_result at TEST_FTRUNCATE_FILL.
+    BOOST_CHECK_EQUAL(size_result.load(), (int)TEST_FTRUNCATE_TARGET);
+
+    // And the on-disk content agrees: reading the whole file yields exactly TARGET bytes.
+    int fd = ::open(TEST_FTRUNCATE_PATH, O_RDONLY);
+    BOOST_REQUIRE(fd > 0);
+    char buffer[256] = {0};
+    BOOST_CHECK_EQUAL(::pread(fd, buffer, sizeof(buffer), 0), (long)TEST_FTRUNCATE_TARGET);
+    ::close(fd);
+
+    unlink(TEST_FTRUNCATE_PATH);
+    scheduler.stop();
+    runner.join();
+}
+
 // ==================== Mutex Test ====================
 
 // Helper coroutine: lock, hold for hold_ns, record its tag, unlock

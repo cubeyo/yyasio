@@ -484,6 +484,46 @@ yyasio::Task<void> statx_demo(yyasio::Scheduler* scheduler)
     unlink(file_path);
 }
 
+// ftruncate() through io_uring (kernel >= 6.11): resize the file behind an open fd to an
+// exact length. Shrinking drops the tail; growing pads with a hole that reads back as
+// zeros. await_resume() gives back the ftruncate(2) result -- 0 on success, -errno
+// otherwise -- and here we verify the new size with statx rather than trusting the return.
+yyasio::Task<void> ftruncate_demo(yyasio::Scheduler* scheduler)
+{
+    std::cout << "=== Ftruncate Demo ===\n";
+
+    const char* file_path = "/tmp/yyasio_ftruncate_demo.txt";
+    const off_t target_len = 5;
+
+    int fd = co_await yyasio::openat(scheduler, AT_FDCWD, file_path, O_RDWR | O_CREAT | O_TRUNC, 0644);
+    if (fd < 0)
+    {
+        std::cerr << "Failed to create file: " << file_path << "\n";
+        co_return;
+    }
+
+    const char* content = "0123456789abcdef"; // 16 bytes, longer than target_len
+    co_await yyasio::write(scheduler, fd, content, strlen(content));
+
+    int ret = co_await yyasio::ftruncate(scheduler, fd, target_len);
+    if (ret < 0)
+    {
+        // -EOPNOTSUPP means the kernel is older than 6.11 and has no IORING_OP_FTRUNCATE
+        std::cerr << "ftruncate failed, ret = " << ret << " (-EOPNOTSUPP = " << -EOPNOTSUPP << ")\n";
+        co_await yyasio::close(scheduler, fd);
+        unlink(file_path);
+        co_return;
+    }
+
+    struct statx stx {};
+    co_await yyasio::statx(scheduler, AT_FDCWD, file_path, &stx);
+    std::cout << "after ftruncate(" << target_len << "): stx_size = " << stx.stx_size
+              << " (was " << strlen(content) << " bytes)\n";
+
+    co_await yyasio::close(scheduler, fd);
+    unlink(file_path);
+}
+
 yyasio::Task<void> visit_regular_file(yyasio::Scheduler* scheduler)
 {
     int dir_fd = co_await yyasio::openat(scheduler, AT_FDCWD, "/tmp", O_RDONLY | O_DIRECTORY);
@@ -780,6 +820,8 @@ int main()
     sync_file_range_demo(&scheduler).detach();
 
     statx_demo(&scheduler).detach();
+
+    ftruncate_demo(&scheduler).detach();
 
     mutex_demo(&scheduler).detach();
 
